@@ -16,8 +16,8 @@ importers:
         specifier: latest
         version: 26.6.2
       adminforth:
-        specifier: ^3.25.0
-        version: 3.27.0(@types/node@26.6.2)(express@5.2.1)
+        specifier: ^3.27.1
+        version: 3.27.1(@types/node@26.6.2)(express@5.2.1)
       semantic-release:
         specifier: ^24.2.1
         version: 24.2.9(typescript@5.9.3)
@@ -729,8 +729,8 @@ packages:
     resolution: {integrity: sha512-5cvg6CtKwfgdmVqY1WIiXKc3Q1bkRqGLi+2W/6ao+6Y7gu/RCwRuAhGEzh5B4KlszSuTLgZYuqFqo5bImjNKng==}
     engines: {node: '>= 0.6'}
 
-  adminforth@3.27.0:
-    resolution: {integrity: sha512-7I0F7iVXKEDsNUQ+Jgc7j4XEx1hCQnJfAeqReT975FiMHit5OgXKnLPbaJKlZCRDfva0EPISNyOOtQiFkILytg==}
+  adminforth@3.27.1:
+    resolution: {integrity: sha512-fQImPsAS7A8Kwt1u8+5WRqdEjrVTrq1b1bw8f7VtFXi1MebPjGQekxUA6rnaUul5TpPamOGLyzTxz6B4/ps4jw==}
     engines: {node: ^22.12.0 || ^24.0.0 || ^26.0.0}
     hasBin: true
     peerDependencies:
@@ -3403,7 +3403,7 @@ snapshots:
       mime-types: 3.0.2
       negotiator: 1.1.0
 
-  adminforth@3.27.0(@types/node@26.6.2)(express@5.2.1):
+  adminforth@3.27.1(@types/node@26.6.2)(express@5.2.1):
     dependencies:
       '@babel/parser': 7.29.9
       '@faker-js/faker': 9.9.0
