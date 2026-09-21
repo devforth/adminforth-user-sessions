@@ -1,0 +1,75 @@
+{
+  "name": "@adminforth/user-sessions",
+  "version": "1.0.0",
+  "description": "AdminForth plugin which shows active sessions of admin user and allows to revoke them",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "type": "module",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "homepage": "https://adminforth.dev/docs/tutorial/Plugins/user-sessions/",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/devforth/adminforth-user-sessions.git"
+  },
+  "bugs": {
+    "url": "https://github.com/devforth/adminforth-user-sessions/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc && rsync -av --exclude 'node_modules' custom dist/",
+    "test": "vitest run"
+  },
+  "keywords": [
+    "adminforth",
+    "sessions",
+    "security",
+    "revoke"
+  ],
+  "author": "DevForth (https://devforth.io)",
+  "license": "MIT",
+  "dependencies": {
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "latest",
+    "adminforth": "^3.25.0",
+    "semantic-release": "^24.2.1",
+    "semantic-release-slack-bot": "^4.0.2",
+    "typescript": "^5.7.3",
+    "vitest": "^3.2.4"
+  },
+  "peerDependencies": {
+    "adminforth": "^3.25.0"
+  },
+  "release": {
+    "plugins": [
+      "@semantic-release/commit-analyzer",
+      "@semantic-release/release-notes-generator",
+      "@semantic-release/npm",
+      "@semantic-release/github",
+      [
+        "semantic-release-slack-bot",
+        {
+          "packageName": "@adminforth/user-sessions",
+          "notifyOnSuccess": true,
+          "notifyOnFail": true,
+          "slackIcon": ":package:",
+          "markdownReleaseNotes": true
+        }
+      ]
+    ],
+    "branches": [
+      "main",
+      {
+        "name": "next",
+        "prerelease": true
+      }
+    ]
+  }
+}

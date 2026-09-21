@@ -1,0 +1,7 @@
+allowBuilds:
+  adminforth: true
+  esbuild: true
+minimumReleaseAgeExclude:
+  - adminforth
+overrides:
+  adminforth: link:../../adminforth
