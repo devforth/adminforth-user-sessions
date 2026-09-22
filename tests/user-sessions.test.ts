@@ -23,6 +23,7 @@ const adminforthMock = vi.hoisted(() => {
 vi.mock('adminforth', () => adminforthMock);
 
 const UserSessionsPlugin = (await import('../index.js')).default;
+const { parseUserAgent } = await import('../userAgent.js');
 
 class MemoryKeyValueAdapter {
   entries = new Map<string, { value: string, expiresInSeconds?: number }>();
@@ -53,12 +54,19 @@ class MemoryKeyValueAdapter {
 }
 
 const USER = { pk: 'user-1', username: 'adminforth', dbUser: {} };
-const HEADERS = { 'x-forwarded-for': '8.8.8.8', 'cf-ipcountry': 'DE' };
+const CHROME_MAC_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+const HEADERS = { 'x-forwarded-for': '8.8.8.8', 'cf-ipcountry': 'DE', 'user-agent': CHROME_MAC_UA };
 
 function createAdminforth() {
   return {
     config: {
+      resources: [{
+        resourceId: 'adminuser',
+        columns: [{ name: 'id', primaryKey: true }],
+        options: {},
+      }] as any[],
       auth: {
+        usersResourceId: 'adminuser',
         afterSessionCreated: [] as any[],
         adminUserAuthorize: [] as any[],
         beforeLogout: [] as any[],
@@ -91,6 +99,10 @@ function hooks() {
     authorize: auth.adminUserAuthorize[0],
     logout: auth.beforeLogout[0],
   };
+}
+
+function responseStub() {
+  return { status: 200, setStatus(code: number) { this.status = code; } };
 }
 
 function endpointsOf(plugin: any) {
@@ -139,6 +151,20 @@ describe('activation', () => {
     expect(plugin.pluginsScope).toEqual('global');
   });
 
+  it('does not touch the users resource when managing other users is not allowed', () => {
+    activate();
+
+    expect(adminforth.config.resources[0].options).toEqual({});
+  });
+
+  it('shows sessions on the users show page when managing other users is allowed', () => {
+    activate({ canManageOtherUsersSessions: async () => true });
+
+    expect(adminforth.config.resources[0].options.pageInjections.show.bottom).toEqual([
+      { file: 'component:UserSessionsOfUser.vue', meta: { primaryKeyField: 'id' } },
+    ]);
+  });
+
   it('refuses to work with adminforth which has no afterSessionCreated hook', () => {
     delete (adminforth.config.auth as any).afterSessionCreated;
 
@@ -154,6 +180,7 @@ describe('session lifecycle', () => {
     expect(storedSession('session-1')).toEqual({
       ip: '8.8.8.8',
       country: 'DE',
+      user_agent: CHROME_MAC_UA,
       created_at: expect.any(String),
       last_used_at: expect.any(String),
     });
@@ -263,6 +290,69 @@ describe('country', () => {
   });
 });
 
+describe('device', () => {
+  it('is parsed out of the stored user agent when sessions are listed', async () => {
+    const endpoints = endpointsOf(activate());
+    await login('session-1');
+
+    const { sessions } = await endpoints['POST /plugin/user-sessions/list']({ adminUser: USER, body: {} });
+
+    expect(sessions[0].device).toEqual({ browser: 'Chrome 131', os: 'macOS', type: 'desktop' });
+  });
+
+  it('is null for a session stored without a user agent', async () => {
+    const endpoints = endpointsOf(activate());
+    await login('session-1', 3600, {});
+
+    const { sessions } = await endpoints['POST /plugin/user-sessions/list']({ adminUser: USER, body: {} });
+
+    expect(sessions[0]).toEqual(expect.objectContaining({ user_agent: null, device: null }));
+  });
+});
+
+describe('user agent parsing', () => {
+  it.each([
+    [
+      'Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1',
+      { browser: 'Safari 18', os: 'iOS 18', type: 'mobile' },
+    ],
+    [
+      'Mozilla/5.0 (iPad; CPU OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/604.1',
+      { browser: 'Safari 17', os: 'iOS 17', type: 'tablet' },
+    ],
+    [
+      'Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36',
+      { browser: 'Chrome 130', os: 'Android 14', type: 'mobile' },
+    ],
+    [
+      'Mozilla/5.0 (Linux; Android 13; SM-X710) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36',
+      { browser: 'Chrome 129', os: 'Android 13', type: 'tablet' },
+    ],
+    [
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0',
+      { browser: 'Edge 131', os: 'Windows', type: 'desktop' },
+    ],
+    [
+      'Mozilla/5.0 (X11; Linux x86_64; rv:133.0) Gecko/20100101 Firefox/133.0',
+      { browser: 'Firefox 133', os: 'Linux', type: 'desktop' },
+    ],
+    [
+      'Mozilla/5.0 (Linux; Android 12; SM-A525F) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/23.0 Chrome/115.0.0.0 Mobile Safari/537.36',
+      { browser: 'Samsung Internet 23', os: 'Android 12', type: 'mobile' },
+    ],
+    [
+      'curl/8.7.1',
+      { browser: null, os: null, type: 'desktop' },
+    ],
+  ])('recognizes %s', (userAgent, expected) => {
+    expect(parseUserAgent(userAgent)).toEqual(expected);
+  });
+
+  it('gives nothing for a missing user agent', () => {
+    expect(parseUserAgent(null)).toBeNull();
+  });
+});
+
 describe('endpoints', () => {
   it('lists sessions of the user, newest first, marking the current one', async () => {
     const plugin = activate();
@@ -273,8 +363,9 @@ describe('endpoints', () => {
     // session of another user must not be listed
     await kv.set('user-2:foreign', '{}', 3600, 'adminforth-user-sessions');
 
-    const { sessions } = await endpoints['GET /plugin/user-sessions/list']({
+    const { sessions } = await endpoints['POST /plugin/user-sessions/list']({
       adminUser: { ...USER, sessionId: 'older' },
+      body: {},
     });
 
     expect(sessions.map((session: any) => session.sessionId)).toEqual(['newer', 'older']);
@@ -290,6 +381,7 @@ describe('endpoints', () => {
     await endpoints['POST /plugin/user-sessions/revoke']({
       adminUser: { ...USER, sessionId: 'session-1' },
       body: { sessionId: 'session-2' },
+      response: responseStub(),
     });
 
     expect(await kv.get(`${USER.pk}:session-2`, 'adminforth-user-sessions')).toBeNull();
@@ -305,11 +397,108 @@ describe('endpoints', () => {
 
     const result = await endpoints['POST /plugin/user-sessions/revoke-others']({
       adminUser: { ...USER, sessionId: 'session-1' },
+      body: {},
+      response: responseStub(),
     });
 
     expect(result).toEqual({ ok: true, revoked: 2 });
     expect(await kv.get(`${USER.pk}:session-1`, 'adminforth-user-sessions')).not.toBeNull();
     expect(await kv.get(`${USER.pk}:session-2`, 'adminforth-user-sessions')).toBeNull();
     expect(await kv.get(`${USER.pk}:session-3`, 'adminforth-user-sessions')).toBeNull();
+  });
+});
+
+describe('sessions of other users', () => {
+  const SUPERADMIN = { pk: 'user-2', username: 'root', dbUser: { role: 'superadmin' }, sessionId: 'own-session' };
+
+  async function loginOf(pk: string, sessionId: string) {
+    await hooks().sessionCreated({
+      pk, username: 'someone', sessionId, expiresInSeconds: 3600, adminforth, extra: extraOf(),
+    });
+  }
+
+  it('are listed to a user the callback allows', async () => {
+    const canManageOtherUsersSessions = vi.fn(async (adminUser: any) => adminUser.dbUser.role === 'superadmin');
+    const endpoints = endpointsOf(activate({ canManageOtherUsersSessions }));
+    await login('their-session');
+
+    const result = await endpoints['POST /plugin/user-sessions/list']({
+      adminUser: SUPERADMIN,
+      body: { userPk: USER.pk },
+    });
+
+    expect(canManageOtherUsersSessions).toHaveBeenCalledWith(SUPERADMIN);
+    expect(result.allowed).toBe(true);
+    expect(result.sessions).toEqual([
+      expect.objectContaining({ sessionId: 'their-session', isCurrent: false }),
+    ]);
+  });
+
+  it('are hidden from a user the callback rejects', async () => {
+    const endpoints = endpointsOf(activate({ canManageOtherUsersSessions: async () => false }));
+    await login('their-session');
+
+    expect(await endpoints['POST /plugin/user-sessions/list']({
+      adminUser: SUPERADMIN,
+      body: { userPk: USER.pk },
+    })).toEqual({ allowed: false, sessions: [] });
+  });
+
+  it('are hidden when no callback is configured', async () => {
+    const endpoints = endpointsOf(activate());
+    await login('their-session');
+
+    expect(await endpoints['POST /plugin/user-sessions/list']({
+      adminUser: SUPERADMIN,
+      body: { userPk: USER.pk },
+    })).toEqual({ allowed: false, sessions: [] });
+  });
+
+  it('are revoked by an allowed user', async () => {
+    const endpoints = endpointsOf(activate({ canManageOtherUsersSessions: async () => true }));
+    await login('their-session');
+
+    const result = await endpoints['POST /plugin/user-sessions/revoke']({
+      adminUser: SUPERADMIN,
+      body: { sessionId: 'their-session', userPk: USER.pk },
+      response: responseStub(),
+    });
+
+    expect(result).toEqual({ ok: true });
+    expect(await kv.get(`${USER.pk}:their-session`, 'adminforth-user-sessions')).toBeNull();
+  });
+
+  it('survive a revoke attempt of a user the callback rejects', async () => {
+    const endpoints = endpointsOf(activate({ canManageOtherUsersSessions: async () => false }));
+    await login('their-session');
+    const response = responseStub();
+
+    const result = await endpoints['POST /plugin/user-sessions/revoke']({
+      adminUser: SUPERADMIN,
+      body: { sessionId: 'their-session', userPk: USER.pk },
+      response,
+    });
+
+    expect(result).toEqual({ error: expect.any(String) });
+    expect(response.status).toEqual(403);
+    expect(await kv.get(`${USER.pk}:their-session`, 'adminforth-user-sessions')).not.toBeNull();
+  });
+
+  it('are all revoked at once, keeping the session of the one who revokes', async () => {
+    const endpoints = endpointsOf(activate({ canManageOtherUsersSessions: async () => true }));
+    await login('their-first');
+    await login('their-second');
+    await loginOf(SUPERADMIN.pk, SUPERADMIN.sessionId);
+
+    const result = await endpoints['POST /plugin/user-sessions/revoke-others']({
+      adminUser: SUPERADMIN,
+      body: { userPk: USER.pk },
+      response: responseStub(),
+    });
+
+    expect(result).toEqual({ ok: true, revoked: 2 });
+    expect(await kv.get(`${USER.pk}:their-first`, 'adminforth-user-sessions')).toBeNull();
+    expect(await kv.get(`${USER.pk}:their-second`, 'adminforth-user-sessions')).toBeNull();
+    expect(await kv.get(`${SUPERADMIN.pk}:${SUPERADMIN.sessionId}`, 'adminforth-user-sessions')).not.toBeNull();
   });
 });

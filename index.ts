@@ -1,5 +1,6 @@
 import { AdminForthPlugin } from "adminforth";
 import type {
+  AdminForthComponentDeclarationFull,
   AdminUser,
   AdminUserAuthorizeFunction,
   AfterSessionCreatedFunction,
@@ -11,6 +12,7 @@ import type {
 } from "adminforth";
 import { z } from "zod";
 import type { PluginOptions, UserSessionListItem, UserSessionRecord } from "./types.js";
+import { parseUserAgent } from "./userAgent.js";
 
 const DEFAULT_COLLECTION = 'adminforth-user-sessions';
 const DEFAULT_COUNTRY_HEADER = 'CF-IPCountry';
@@ -20,8 +22,13 @@ const ENDPOINTS_PREFIX = '/plugin/user-sessions';
 const SESSIONS_LIST_LIMIT = 500;
 const COUNTRY_CODE_RE = /^[A-Z]{2}$/;
 
+const listBodySchema = z.object({
+  userPk: z.string().optional(),
+}).strict();
+
 const revokeBodySchema = z.object({
   sessionId: z.string(),
+  userPk: z.string().optional(),
 }).strict();
 
 export default class UserSessionsPlugin extends AdminForthPlugin {
@@ -77,6 +84,42 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
       // page is dropped from /get_config when isVisible is not set
       isVisible: () => true,
     });
+
+    if (this.options.canManageOtherUsersSessions) {
+      this.showSessionsOnUsersResource(adminforth, auth.usersResourceId!);
+    }
+  }
+
+  /**
+   * Adds sessions block to the show page of the users resource, so privileged users can see and
+   * revoke sessions of the user they are looking at.
+   */
+  private showSessionsOnUsersResource(adminforth: IAdminForth, usersResourceId: string) {
+    const usersResource = adminforth.config.resources.find(
+      (resource) => resource.resourceId === usersResourceId,
+    )!;
+    const pageInjections = (usersResource.options!.pageInjections ??= {});
+    const showInjections = (pageInjections.show ??= {});
+    showInjections.bottom ??= [];
+
+    (showInjections.bottom as AdminForthComponentDeclarationFull[]).push({
+      file: this.componentPath('UserSessionsOfUser.vue'),
+      meta: {
+        primaryKeyField: usersResource.columns.find((column) => column.primaryKey)!.name,
+      },
+    });
+  }
+
+  /**
+   * Own sessions are always managable, sessions of other users only when the app allows it.
+   */
+  private async canManage(adminUser: AdminUser, userPk: string | null): Promise<boolean> {
+    if (userPk === adminUser.pk) {
+      return true;
+    }
+    return this.options.canManageOtherUsersSessions
+      ? await this.options.canManageOtherUsersSessions(adminUser)
+      : false;
   }
 
   private get kv(): KeyValueAdapter {
@@ -94,6 +137,7 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
     const record: UserSessionRecord = {
       ip,
       country: await this.resolveCountry(ip, headers),
+      user_agent: headers['user-agent'] ?? null,
       created_at: now,
       last_used_at: now,
     };
@@ -155,17 +199,19 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
     );
   }
 
-  private async listSessions(adminUser: AdminUser): Promise<UserSessionListItem[]> {
-    const rows = await this.kv.listByPrefix(`${adminUser.pk}:`, SESSIONS_LIST_LIMIT, this.collection);
+  private async listSessions(userPk: string | null, currentSessionId?: string): Promise<UserSessionListItem[]> {
+    const rows = await this.kv.listByPrefix(`${userPk}:`, SESSIONS_LIST_LIMIT, this.collection);
 
     return rows
       .map((row) => {
         const [key] = Object.keys(row);
         const sessionId = key.slice(key.lastIndexOf(':') + 1);
+        const record = JSON.parse(row[key]) as UserSessionRecord;
         return {
-          ...JSON.parse(row[key]) as UserSessionRecord,
+          ...record,
           sessionId,
-          isCurrent: sessionId === adminUser.sessionId,
+          isCurrent: sessionId === currentSessionId,
+          device: parseUserAgent(record.user_agent),
         };
       })
       .sort((a, b) => b.created_at.localeCompare(a.created_at));
@@ -173,20 +219,29 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
 
   setupEndpoints(server: IHttpServer) {
     server.endpoint({
-      method: 'GET',
+      method: 'POST',
       path: `${ENDPOINTS_PREFIX}/list`,
-      handler: async ({ adminUser }) => ({
-        sessions: await this.listSessions(adminUser),
-      }),
+      request_schema: listBodySchema,
+      handler: async ({ adminUser, body }) => {
+        const userPk = body.userPk ?? adminUser.pk;
+        if (!await this.canManage(adminUser, userPk)) {
+          return { allowed: false, sessions: [] };
+        }
+        return { allowed: true, sessions: await this.listSessions(userPk, adminUser.sessionId) };
+      },
     });
 
     server.endpoint({
       method: 'POST',
       path: `${ENDPOINTS_PREFIX}/revoke`,
       request_schema: revokeBodySchema,
-      handler: async ({ adminUser, body }) => {
-        // key is built from pk of the caller, so one user can't revoke sessions of another one
-        await this.kv.delete(sessionKey(adminUser.pk, body.sessionId), this.collection);
+      handler: async ({ adminUser, body, response }) => {
+        const userPk = body.userPk ?? adminUser.pk;
+        if (!await this.canManage(adminUser, userPk)) {
+          response.setStatus(403);
+          return { error: 'Not allowed to manage sessions of this user' };
+        }
+        await this.kv.delete(sessionKey(userPk, body.sessionId), this.collection);
         return { ok: true };
       },
     });
@@ -194,11 +249,18 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
     server.endpoint({
       method: 'POST',
       path: `${ENDPOINTS_PREFIX}/revoke-others`,
-      handler: async ({ adminUser }) => {
-        const sessions = await this.listSessions(adminUser);
+      request_schema: listBodySchema,
+      handler: async ({ adminUser, body, response }) => {
+        const userPk = body.userPk ?? adminUser.pk;
+        if (!await this.canManage(adminUser, userPk)) {
+          response.setStatus(403);
+          return { error: 'Not allowed to manage sessions of this user' };
+        }
+        // session the request is made with survives, for another user it means all of their sessions go
+        const sessions = await this.listSessions(userPk, adminUser.sessionId);
         const revoked = sessions.filter((session) => !session.isCurrent);
         await Promise.all(
-          revoked.map((session) => this.kv.delete(sessionKey(adminUser.pk, session.sessionId), this.collection))
+          revoked.map((session) => this.kv.delete(sessionKey(userPk, session.sessionId), this.collection))
         );
         return { ok: true, revoked: revoked.length };
       },
