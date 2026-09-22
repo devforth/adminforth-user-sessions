@@ -56,8 +56,12 @@
         {{ formatDateTime(item.last_used_at) }}
       </template>
 
+      <template #header:actions="{ column }">
+        <span class="flex justify-center">{{ column.label }}</span>
+      </template>
+
       <template #cell:actions="{ item }">
-        <div class="flex justify-end">
+        <div class="flex justify-center">
           <Button
             v-if="!item.isCurrent"
             variant="danger"
