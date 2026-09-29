@@ -12,15 +12,19 @@ const BROWSERS: { name: string, re: RegExp }[] = [
   { name: 'Vivaldi', re: /Vivaldi\/(\d+)/ },
   { name: 'Firefox', re: /(?:Firefox|FxiOS)\/(\d+)/ },
   { name: 'Chrome', re: /(?:Chrome|CriOS)\/(\d+)/ },
-  // safari on ios puts a `Mobile/<build>` token between its version and the Safari one
-  { name: 'Safari', re: /Version\/(\d+)[\d.]*(?: Mobile\/\S+)? Safari/ },
+  // safari on ios puts a `Mobile/<build>` token between its version and the Safari one.
+  // Minor version must start with a dot, so the major one has a single way to match the digits:
+  // `(\d+)[\d.]*` backtracks quadratically on a long run of digits
+  { name: 'Safari', re: /Version\/(\d+)(?:\.[\d.]*)?(?: Mobile\/\S+)? Safari/ },
 ];
 
 const OSES: { name: string, re: RegExp }[] = [
   { name: 'Windows', re: /Windows NT [\d.]+/ },
   { name: 'ChromeOS', re: /CrOS/ },
   { name: 'Android', re: /Android (\d+)/ },
-  { name: 'iOS', re: /(?:iPhone|iPad|iPod).* OS (\d+)/ },
+  // iPhone and iPod send `CPU iPhone OS 18_1`, iPad sends `CPU OS 18_1`. Anchoring on that token
+  // instead of `(?:iPhone|iPad|iPod).* OS` avoids rescanning the rest of the string for every device name
+  { name: 'iOS', re: /CPU (?:iPhone )?OS (\d+)/ },
   { name: 'macOS', re: /Mac OS X/ },
   { name: 'Linux', re: /Linux|X11/ },
 ];

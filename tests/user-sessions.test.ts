@@ -187,6 +187,13 @@ describe('session lifecycle', () => {
     expect(kv.entries.get(`adminforth-user-sessions:${USER.pk}:session-1`)!.expiresInSeconds).toEqual(900);
   });
 
+  it('truncates an oversized user agent before storing it', async () => {
+    activate();
+    await login('session-1', 3600, { ...HEADERS, 'user-agent': 'Version/' + '1'.repeat(15800) });
+
+    expect(storedSession('session-1').user_agent).toHaveLength(512);
+  });
+
   it('allows request of stored session and rejects revoked one', async () => {
     activate();
     await login('session-1');
@@ -319,6 +326,10 @@ describe('user agent parsing', () => {
     [
       'Mozilla/5.0 (iPad; CPU OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/604.1',
       { browser: 'Safari 17', os: 'iOS 17', type: 'tablet' },
+    ],
+    [
+      'Mozilla/5.0 (iPod touch; CPU iPhone OS 15_8 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.6.6 Mobile/15E148 Safari/604.1',
+      { browser: 'Safari 15', os: 'iOS 15', type: 'mobile' },
     ],
     [
       'Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36',

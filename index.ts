@@ -20,6 +20,8 @@ const DEFAULT_LAST_USED_THROTTLE_SECONDS = 60;
 const ENDPOINTS_PREFIX = '/plugin/user-sessions';
 // listing is done for one user only, so the limit is just a sanity cap
 const SESSIONS_LIST_LIMIT = 500;
+// real user agents are well under this; the header itself is client-controlled and can be ~16KB
+const USER_AGENT_MAX_LENGTH = 512;
 const COUNTRY_CODE_RE = /^[A-Z]{2}$/;
 
 const listBodySchema = z.object({
@@ -137,7 +139,7 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
     const record: UserSessionRecord = {
       ip,
       country: await this.resolveCountry(ip, headers),
-      user_agent: headers['user-agent'] ?? null,
+      user_agent: headers['user-agent']?.slice(0, USER_AGENT_MAX_LENGTH) ?? null,
       created_at: now,
       last_used_at: now,
     };
