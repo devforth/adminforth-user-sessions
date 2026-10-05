@@ -17,7 +17,7 @@ const adminforthMock = vi.hoisted(() => {
     }
   }
 
-  return { AdminForthPlugin };
+  return { AdminForthPlugin, afLogger: { error: vi.fn() } };
 });
 
 vi.mock('adminforth', () => adminforthMock);
@@ -219,6 +219,14 @@ describe('session lifecycle', () => {
     await hooks().logout({ adminUser: { ...USER, sessionId: 'session-1' } });
 
     expect(await kv.get(`${USER.pk}:session-1`, 'adminforth-user-sessions')).toBeNull();
+  });
+
+  it('does not fail logout when key-value store is unavailable', async () => {
+    activate();
+    await login('session-1');
+    kv.delete = async () => { throw new Error('connection refused'); };
+
+    await expect(hooks().logout({ adminUser: { ...USER, sessionId: 'session-1' } })).resolves.toBeUndefined();
   });
 
   it('does not fail logout of a session which was never stored', async () => {

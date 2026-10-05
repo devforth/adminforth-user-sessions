@@ -1,4 +1,4 @@
-import { AdminForthPlugin } from "adminforth";
+import { AdminForthPlugin, afLogger } from "adminforth";
 import type {
   AdminForthComponentDeclarationFull,
   AdminUser,
@@ -71,8 +71,14 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
 
     (auth.beforeLogout as BeforeLogoutFunction[]).push(
       async ({ adminUser }) => {
-        if (adminUser?.sessionId) {
+        if (!adminUser?.sessionId) {
+          return;
+        }
+        // older AdminForth releases abort logout and keep the auth cookie when a beforeLogout hook throws
+        try {
           await this.kv.delete(sessionKey(adminUser.pk, adminUser.sessionId), this.collection);
+        } catch (e) {
+          afLogger.error(`UserSessionsPlugin: failed to revoke session on logout: ${e}`);
         }
       }
     );
