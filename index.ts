@@ -124,7 +124,7 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
    * Own sessions are always managable, sessions of other users only when the app allows it.
    */
   private async canManage(adminUser: AdminUser, userPk: string | null): Promise<boolean> {
-    if (userPk === adminUser.pk) {
+    if (String(userPk) === String(adminUser.pk)) {
       return true;
     }
     return this.options.canManageOtherUsersSessions

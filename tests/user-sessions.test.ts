@@ -493,6 +493,21 @@ describe('endpoints', () => {
     expect(await kv.get(`${USER.pk}:session-2`, 'adminforth-user-sessions')).toBeNull();
     expect(await kv.get(`${USER.pk}:session-3`, 'adminforth-user-sessions')).toBeNull();
   });
+
+  it('treats sessions as own for integer primary key, which the users show page sends as a string', async () => {
+    const endpoints = endpointsOf(activate({ canManageOtherUsersSessions: async () => false }));
+    await hooks().sessionCreated({
+      pk: 7, username: 'someone', sessionId: 'own-session', expiresInSeconds: 3600, adminforth, extra: extraOf(),
+    });
+
+    const result = await endpoints['POST /plugin/user-sessions/list']({
+      adminUser: { ...USER, pk: 7, sessionId: 'own-session' },
+      body: { userPk: '7' },
+    });
+
+    expect(result.allowed).toBe(true);
+    expect(result.sessions).toEqual([expect.objectContaining({ sessionId: 'own-session', isCurrent: true })]);
+  });
 });
 
 describe('sessions of other users', () => {
