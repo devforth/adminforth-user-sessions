@@ -49,7 +49,9 @@ Without this option, sessions of other users are not shown and can't be revoked 
   `last_used_at`.
 - `auth.adminUserAuthorize` hook checks that the session of the request is still stored, and
   refreshes its `last_used_at`. A session which is not stored is rejected with 401.
-- `auth.beforeLogout` hook and the revoke endpoints delete the stored session.
+- `auth.beforeLogout` hook and the revoke endpoints delete the stored session, and delete it once
+  more 5 seconds later: a request running at that moment may have read the session just before and
+  write it back while refreshing `last_used_at`.
 
 Because a missing record means "revoked", the store must outlive the app process: use Redis (or
 another shared, persistent adapter) in production. With an in-memory adapter every restart signs

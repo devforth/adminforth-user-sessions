@@ -17,6 +17,8 @@ import { parseUserAgent } from "./userAgent.js";
 const DEFAULT_COLLECTION = 'adminforth-user-sessions';
 const DEFAULT_COUNTRY_HEADER = 'CF-IPCountry';
 const DEFAULT_LAST_USED_THROTTLE_SECONDS = 60;
+// way longer than a request takes between reading the session and writing it back in touchSession
+const REVOKE_REPEAT_DELAY_MS = 5000;
 const ENDPOINTS_PREFIX = '/plugin/user-sessions';
 // listing is done for one user only, so the limit is just a sanity cap
 const SESSIONS_LIST_LIMIT = 500;
@@ -76,7 +78,7 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
         }
         // older AdminForth releases abort logout and keep the auth cookie when a beforeLogout hook throws
         try {
-          await this.kv.delete(sessionKey(adminUser.pk, adminUser.sessionId), this.collection);
+          await this.revokeSession(adminUser.pk, adminUser.sessionId);
         } catch (e) {
           afLogger.error(`UserSessionsPlugin: failed to revoke session on logout: ${e}`);
         }
@@ -150,6 +152,20 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
       last_used_at: now,
     };
     await this.kv.set(sessionKey(pk, sessionId), JSON.stringify(record), expiresInSeconds, this.collection);
+  }
+
+  /**
+   * Deletes the session, then deletes it once more a bit later: a request which read the session
+   * right before the first delete may still write it back while refreshing `last_used_at`.
+   */
+  private async revokeSession(pk: string | null, sessionId: string) {
+    const key = sessionKey(pk, sessionId);
+    await this.kv.delete(key, this.collection);
+    setTimeout(() => {
+      this.kv.delete(key, this.collection).catch((e) => {
+        afLogger.error(`UserSessionsPlugin: failed to repeat revoke of session: ${e}`);
+      });
+    }, REVOKE_REPEAT_DELAY_MS).unref();
   }
 
   private async resolveCountry(ip: string | null, headers: Record<string, string>): Promise<string | null> {
@@ -249,7 +265,7 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
           response.setStatus(403);
           return { error: 'Not allowed to manage sessions of this user' };
         }
-        await this.kv.delete(sessionKey(userPk, body.sessionId), this.collection);
+        await this.revokeSession(userPk, body.sessionId);
         return { ok: true };
       },
     });
@@ -267,9 +283,7 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
         // session the request is made with survives, for another user it means all of their sessions go
         const sessions = await this.listSessions(userPk, adminUser.sessionId);
         const revoked = sessions.filter((session) => !session.isCurrent);
-        await Promise.all(
-          revoked.map((session) => this.kv.delete(sessionKey(userPk, session.sessionId), this.collection))
-        );
+        await Promise.all(revoked.map((session) => this.revokeSession(userPk, session.sessionId)));
         return { ok: true, revoked: revoked.length };
       },
     });

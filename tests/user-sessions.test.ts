@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const adminforthMock = vi.hoisted(() => {
   class AdminForthPlugin {
@@ -274,6 +274,74 @@ describe('last used time', () => {
     });
 
     expect(storedSession('session-1').last_used_at).toEqual(lastUsedAt);
+  });
+});
+
+describe('revoke racing with a request of the revoked session', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  // makes the revoke land right between the session check and the write of last_used_at
+  function revokeOnNextWrite(revoke: () => Promise<unknown>) {
+    const set = kv.set.bind(kv);
+    kv.set = async (...args: Parameters<typeof set>) => {
+      kv.set = set;
+      await revoke();
+      await set(...args);
+    };
+  }
+
+  it('deletes the session again after the request wrote it back', async () => {
+    const endpoints = endpointsOf(activate({ lastUsedThrottleSeconds: 0 }));
+    await login('session-1');
+    await login('session-2');
+    const adminUser = { ...USER, sessionId: 'session-2' };
+    revokeOnNextWrite(() => endpoints['POST /plugin/user-sessions/revoke']({
+      adminUser: { ...USER, sessionId: 'session-1' },
+      body: { sessionId: 'session-2' },
+      response: responseStub(),
+    }));
+
+    await hooks().authorize({ adminUser });
+    expect(await kv.get(`${USER.pk}:session-2`, 'adminforth-user-sessions')).not.toBeNull();
+
+    await vi.advanceTimersByTimeAsync(5000);
+
+    expect(await hooks().authorize({ adminUser })).toEqual({ allowed: false, error: 'Session was revoked' });
+  });
+
+  it('deletes the session again after logout', async () => {
+    activate({ lastUsedThrottleSeconds: 0 });
+    await login('session-1');
+    const adminUser = { ...USER, sessionId: 'session-1' };
+    revokeOnNextWrite(() => hooks().logout({ adminUser }));
+
+    await hooks().authorize({ adminUser });
+    await vi.advanceTimersByTimeAsync(5000);
+
+    expect(await kv.get(`${USER.pk}:session-1`, 'adminforth-user-sessions')).toBeNull();
+  });
+
+  it('logs a failed repeated delete instead of throwing it', async () => {
+    const endpoints = endpointsOf(activate());
+    await login('session-1');
+    await endpoints['POST /plugin/user-sessions/revoke']({
+      adminUser: USER,
+      body: { sessionId: 'session-1' },
+      response: responseStub(),
+    });
+    kv.delete = async () => { throw new Error('connection refused'); };
+
+    await vi.advanceTimersByTimeAsync(5000);
+
+    expect(adminforthMock.afLogger.error).toHaveBeenCalledWith(
+      expect.stringMatching(/failed to repeat revoke.*connection refused/),
+    );
   });
 });
 
