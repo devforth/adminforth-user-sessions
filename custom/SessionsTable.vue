@@ -210,6 +210,11 @@ async function revokeAll() {
         message: t('Revoked {count} session(s)', { count: response.revoked }),
         variant: 'success',
       });
+    } else if (response) {
+      adminforth.alert({
+        message: t('Revoked {count} session(s), some are still active. Please try again.', { count: response.revoked ?? 0 }),
+        variant: 'danger',
+      });
     }
     await loadSessions();
   } finally {

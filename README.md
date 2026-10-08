@@ -53,6 +53,10 @@ Without this option, sessions of other users are not shown and can't be revoked 
   more 5 seconds later: a request running at that moment may have read the session just before and
   write it back while refreshing `last_used_at`.
 
+Revoking all sessions at once lists and deletes in rounds, since one listing is capped at 500 rows.
+With `@adminforth/key-value-adapter-redis` below 2.0.3 that listing can return nothing while sessions
+are still active, and the endpoint then reports success having revoked nothing.
+
 Because a missing record means "revoked", the store must outlive the app process: use Redis (or
 another shared, persistent adapter) in production. With an in-memory adapter every restart signs
 all users out. Installing the plugin also signs out everyone who was logged in before it.

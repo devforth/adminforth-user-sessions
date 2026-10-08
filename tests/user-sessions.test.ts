@@ -23,6 +23,7 @@ const adminforthMock = vi.hoisted(() => {
 vi.mock('adminforth', () => adminforthMock);
 
 const UserSessionsPlugin = (await import('../index.js')).default;
+const { REVOKE_OTHERS_MAX_ROUNDS } = await import('../index.js');
 const { parseUserAgent } = await import('../userAgent.js');
 
 class MemoryKeyValueAdapter {
@@ -492,6 +493,71 @@ describe('endpoints', () => {
     expect(await kv.get(`${USER.pk}:session-1`, 'adminforth-user-sessions')).not.toBeNull();
     expect(await kv.get(`${USER.pk}:session-2`, 'adminforth-user-sessions')).toBeNull();
     expect(await kv.get(`${USER.pk}:session-3`, 'adminforth-user-sessions')).toBeNull();
+  });
+
+  it('revokes every other session past the listing cap', async () => {
+    const endpoints = endpointsOf(activate());
+    await login('current');
+    const others = Array.from({ length: 501 }, (_, index) => `other-${index}`);
+    for (const sessionId of others) {
+      await login(sessionId);
+    }
+
+    const listed = vi.spyOn(kv, 'listByPrefix');
+    const result = await endpoints['POST /plugin/user-sessions/revoke-others']({
+      adminUser: { ...USER, sessionId: 'current' },
+      body: {},
+      response: responseStub(),
+    });
+
+    expect(listed.mock.calls.length).toBeGreaterThan(1);
+    const survivors: string[] = [];
+    for (const sessionId of others) {
+      if (await kv.get(`${USER.pk}:${sessionId}`, 'adminforth-user-sessions')) {
+        survivors.push(sessionId);
+      }
+    }
+
+    expect(result).toEqual({ ok: true, revoked: 501 });
+    expect(survivors).toEqual([]);
+    expect(await kv.get(`${USER.pk}:current`, 'adminforth-user-sessions')).not.toBeNull();
+  });
+
+  it('gives up instead of looping forever when the adapter does not delete', async () => {
+    const endpoints = endpointsOf(activate());
+    await login('current');
+    await login('other');
+    kv.delete = async () => {};
+
+    const result = await endpoints['POST /plugin/user-sessions/revoke-others']({
+      adminUser: { ...USER, sessionId: 'current' },
+      body: {},
+      response: responseStub(),
+    });
+
+    expect(result).toEqual({ ok: false, revoked: 1 });
+    expect(adminforthMock.afLogger.error).toHaveBeenCalledWith(
+      `UserSessionsPlugin: gave up revoking sessions of user-1 after ${REVOKE_OTHERS_MAX_ROUNDS} rounds, 1 revoked`,
+    );
+  });
+
+  it('revokes a session of another user whose id matches the session of the managing user', async () => {
+    const endpoints = endpointsOf(activate({ canManageOtherUsersSessions: async () => true }));
+    const manager = { pk: 'user-2', username: 'root', dbUser: {}, sessionId: 'shared-id' };
+    await hooks().sessionCreated({
+      pk: manager.pk, username: manager.username, sessionId: manager.sessionId, expiresInSeconds: 3600, adminforth, extra: extraOf(),
+    });
+    await login('shared-id');
+
+    const result = await endpoints['POST /plugin/user-sessions/revoke-others']({
+      adminUser: manager,
+      body: { userPk: USER.pk },
+      response: responseStub(),
+    });
+
+    expect(result).toEqual({ ok: true, revoked: 1 });
+    expect(await kv.get(`${USER.pk}:shared-id`, 'adminforth-user-sessions')).toBeNull();
+    expect(await kv.get(`${manager.pk}:shared-id`, 'adminforth-user-sessions')).not.toBeNull();
   });
 
   it('treats sessions as own for integer primary key, which the users show page sends as a string', async () => {
