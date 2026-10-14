@@ -604,3 +604,108 @@ describe('sessions of other users', () => {
     expect(await kv.get(`${SUPERADMIN.pk}:${SUPERADMIN.sessionId}`, 'adminforth-user-sessions')).not.toBeNull();
   });
 });
+
+describe('an identity whose primary key is a prefix of another', () => {
+  // keys join pk and session id with ":", so "u:" is a prefix of every key of "u:v" as well
+  const OWNER = { pk: 'u', username: 'u', dbUser: { role: 'user' }, sessionId: 'own' };
+
+  async function loginAs(pk: string, sessionId: string) {
+    await hooks().sessionCreated({
+      pk, username: 'someone', sessionId, expiresInSeconds: 3600, adminforth, extra: extraOf(),
+    });
+  }
+
+  function schemaOf(plugin: any, route: string) {
+    let found: any;
+    plugin.setupEndpoints({
+      endpoint: ({ method, path, request_schema }: any) => {
+        if (`${method} ${path}` === route) found = request_schema;
+      },
+    });
+    return found;
+  }
+
+  it('does not reach the sessions of u:v when u lists its own', async () => {
+    const endpoints = endpointsOf(activate());
+    await loginAs('u', 'own');
+    await loginAs('u:v', 'theirs');
+
+    const { sessions } = await endpoints['POST /plugin/user-sessions/list']({
+      adminUser: OWNER,
+      body: {},
+    });
+
+    expect(sessions.map((session: any) => session.sessionId)).toEqual(['own']);
+  });
+
+  it('lists the sessions of u:v for u:v itself, with the id they were created under', async () => {
+    const endpoints = endpointsOf(activate());
+    await loginAs('u:v', 'theirs');
+
+    const { sessions } = await endpoints['POST /plugin/user-sessions/list']({
+      adminUser: { pk: 'u:v', username: 'v', dbUser: { role: 'user' }, sessionId: 'theirs' },
+      body: {},
+    });
+
+    expect(sessions).toEqual([expect.objectContaining({ sessionId: 'theirs', isCurrent: true })]);
+  });
+
+  it('leaves the sessions of u:v alone when u revokes all of its own', async () => {
+    const endpoints = endpointsOf(activate());
+    await loginAs('u', 'own');
+    await loginAs('u', 'other');
+    await loginAs('u:v', 'theirs');
+
+    const result = await endpoints['POST /plugin/user-sessions/revoke-others']({
+      adminUser: OWNER,
+      body: {},
+      response: responseStub(),
+    });
+
+    expect(result).toEqual({ ok: true, revoked: 1 });
+    expect(await kv.get('u:v:theirs', 'adminforth-user-sessions')).not.toBeNull();
+    expect(await kv.get('u:other', 'adminforth-user-sessions')).toBeNull();
+  });
+
+  it('refuses a session id carrying the delimiter, and keeps refusing it as JSON Schema', async () => {
+    const { z } = await import('zod');
+    const schema = schemaOf(activate(), 'POST /plugin/user-sessions/revoke');
+
+    expect(schema.safeParse({ sessionId: 'plain' }).success).toBe(true);
+    expect(schema.safeParse({ sessionId: 'v:theirs' }).success).toBe(false);
+
+    // the server validates the converted schema, where a refine() predicate would be dropped
+    const asJsonSchema: any = z.toJSONSchema(schema as any, { target: 'draft-07' });
+    const pattern = new RegExp(asJsonSchema.properties.sessionId.pattern);
+    expect(pattern.test('plain')).toBe(true);
+    expect(pattern.test('v:theirs')).toBe(false);
+  });
+});
+
+describe('a longer primary key crowding the listing', () => {
+  // keys sort byte-by-byte, so "u:v:…" comes before "u:z…": the sibling fills the page first
+  async function loginAs(pk: string, sessionId: string) {
+    await hooks().sessionCreated({
+      pk, username: 'someone', sessionId, expiresInSeconds: 3600, adminforth, extra: extraOf(),
+    });
+  }
+
+  it('still lists the sessions of u when u:v fills the whole page', async () => {
+    const endpoints = endpointsOf(activate());
+    for (let n = 0; n < 500; n++) {
+      await loginAs('u:v', `s${String(n).padStart(4, '0')}`);
+    }
+    for (let n = 0; n < 10; n++) {
+      await loginAs('u', `z${n}`);
+    }
+
+    const { sessions } = await endpoints['POST /plugin/user-sessions/list']({
+      adminUser: { pk: 'u', username: 'u', dbUser: { role: 'user' }, sessionId: 'z0' },
+      body: {},
+    });
+
+    expect(sessions.map((session: any) => session.sessionId).sort()).toEqual(
+      Array.from({ length: 10 }, (_, n) => `z${n}`).sort(),
+    );
+  });
+});

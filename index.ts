@@ -22,6 +22,7 @@ const REVOKE_REPEAT_DELAY_MS = 5000;
 const ENDPOINTS_PREFIX = '/plugin/user-sessions';
 // listing is done for one user only, so the limit is just a sanity cap
 const SESSIONS_LIST_LIMIT = 500;
+const SESSIONS_LIST_ROUNDS = 3;
 // real user agents are well under this; the header itself is client-controlled and can be ~16KB
 const USER_AGENT_MAX_LENGTH = 512;
 const COUNTRY_CODE_RE = /^[A-Z]{2}$/;
@@ -31,7 +32,9 @@ const listBodySchema = z.object({
 }).strict();
 
 const revokeBodySchema = z.object({
-  sessionId: z.string(),
+  // the key joins pk and session id with ":", so a session id carrying one would address another
+  // identity's key. A pattern survives the conversion to JSON Schema that validates this; refine does not
+  sessionId: z.string().regex(/^[^:]+$/),
   userPk: z.string().optional(),
 }).strict();
 
@@ -141,6 +144,10 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
   }
 
   private async storeSession(pk: string | null, sessionId: string, expiresInSeconds: number, extra?: HttpExtra) {
+    if (sessionId.includes(':')) {
+      // core generates a uuid; an id supplied with one would be stored but never listed or revoked
+      afLogger.warn(`UserSessionsPlugin: session id "${sessionId}" contains ":", it will not be listed or revocable`);
+    }
     const headers = extra?.headers ?? {};
     const ip = extra ? this.adminforth.auth.getClientIp(headers) : null;
     const now = new Date().toISOString();
@@ -224,13 +231,30 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
   }
 
   private async listSessions(userPk: string | null, currentSessionId?: string): Promise<UserSessionListItem[]> {
-    const rows = await this.kv.listByPrefix(`${userPk}:`, SESSIONS_LIST_LIMIT, this.collection);
+    const prefix = `${userPk}:`;
+    let requested = SESSIONS_LIST_LIMIT;
+    let own: { sessionId: string, stored: string }[] = [];
 
-    return rows
-      .map((row) => {
-        const [key] = Object.keys(row);
-        const sessionId = key.slice(key.lastIndexOf(':') + 1);
-        const record = JSON.parse(row[key]) as UserSessionRecord;
+    // a longer pk shares this prefix and its rows can fill the page, so ask again for as many as
+    // were dropped: a session id never contains the delimiter, a remainder that does is not ours
+    for (let round = 0; round < SESSIONS_LIST_ROUNDS; round++) {
+      const rows = await this.kv.listByPrefix(prefix, requested, this.collection);
+      own = rows
+        .map((row) => {
+          const [key] = Object.keys(row);
+          return { sessionId: key.slice(prefix.length), stored: row[key] };
+        })
+        .filter(({ sessionId }) => !sessionId.includes(':'));
+      if (own.length >= SESSIONS_LIST_LIMIT || rows.length < requested) {
+        break;
+      }
+      requested += rows.length - own.length;
+    }
+
+    return own
+      .slice(0, SESSIONS_LIST_LIMIT)
+      .map(({ sessionId, stored }) => {
+        const record = JSON.parse(stored) as UserSessionRecord;
         return {
           ...record,
           sessionId,
