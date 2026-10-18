@@ -87,7 +87,7 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
 
     auth.userMenuSettingsPages ??= [];
     auth.userMenuSettingsPages.push({
-      icon: 'flowbite:desktop-pc-outline',
+      icon: 'lucide:monitor-smartphone',
       pageLabel: 'Active sessions',
       slug: 'user-sessions',
       component: this.componentPath('UserSessions.vue'),

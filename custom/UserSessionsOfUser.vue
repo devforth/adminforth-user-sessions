@@ -1,17 +1,10 @@
 <template>
   <div class="mt-6">
-    <SessionsTable :userPk="userPk">
-      <template #heading>
-        <div>
-          <h3 class="text-xl font-semibold leading-none text-gray-800 dark:text-gray-50">
-            {{ $t('Active sessions') }}
-          </h3>
-          <p class="mt-2 text-sm text-gray-600 dark:text-gray-300">
-            {{ $t('Browsers this user is signed in from.') }}
-          </p>
-        </div>
-      </template>
-    </SessionsTable>
+    <SessionsTable
+      :userPk="userPk"
+      :title="$t('Active sessions')"
+      :description="$t('Browsers this user is signed in from.')"
+    />
   </div>
 </template>
 

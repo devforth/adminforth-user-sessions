@@ -45,7 +45,7 @@
     "vitest": "^3.2.4"
   },
   "peerDependencies": {
-    "adminforth": "^3.25.0"
+    "adminforth": "^4.1.0"
   },
   "release": {
     "plugins": [

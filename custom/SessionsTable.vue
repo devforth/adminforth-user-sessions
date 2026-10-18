@@ -1,16 +1,17 @@
 <template>
   <div v-if="allowed">
-    <div class="flex flex-wrap items-start justify-between gap-4">
-      <slot name="heading" />
-      <Button
-        variant="danger"
-        :disabled="!revokableCount || revokingAll"
-        :loader="revokingAll"
-        @click="revokeAll"
-      >
-        {{ userPk ? $t('Revoke all sessions') : $t('Revoke all other sessions') }}
-      </Button>
-    </div>
+    <PageHeader :title="title" :description="description">
+      <template #actions>
+        <Button
+          variant="danger"
+          :disabled="!revokableCount || revokingAll"
+          :loader="revokingAll"
+          @click="revokeAll"
+        >
+          {{ userPk ? $t('Revoke all sessions') : $t('Revoke all other sessions') }}
+        </Button>
+      </template>
+    </PageHeader>
 
     <Table
       class="mt-6"
@@ -21,12 +22,12 @@
     >
       <template #cell:device="{ item }">
         <div class="flex items-center gap-2">
-          <component :is="DEVICE_ICONS[item.device?.type ?? 'unknown']" class="w-5 h-5 shrink-0 text-gray-500 dark:text-gray-400" />
+          <component :is="DEVICE_ICONS[item.device?.type ?? 'unknown']" class="w-4 h-4 shrink-0 text-lightInputIconColor dark:text-darkInputIconColor" />
           <div>
-            <p :class="item.device ? 'font-medium text-gray-900 dark:text-white' : 'text-gray-400'">
+            <p :class="item.device ? 'font-medium' : 'text-lightInputPlaceholderText dark:text-darkInputPlaceholderText'">
               {{ deviceLabel(item.device) }}
             </p>
-            <p v-if="item.isCurrent" class="mt-0.5 text-xs font-medium text-green-600 dark:text-green-400">
+            <p v-if="item.isCurrent" class="mt-0.5 text-xs font-medium text-lightSuccess dark:text-darkSuccess">
               {{ $t('This device') }}
             </p>
           </div>
@@ -36,14 +37,14 @@
       <template #cell:country="{ item }">
         <div class="flex items-center gap-2">
           <CountryFlag v-if="item.country" :countryCode="item.country" />
-          <span :class="item.country ? 'text-gray-900 dark:text-white' : 'text-gray-400'">
+          <span :class="{ 'text-lightInputPlaceholderText dark:text-darkInputPlaceholderText': !item.country }">
             {{ item.country || $t('Unknown') }}
           </span>
         </div>
       </template>
 
       <template #cell:ip="{ item }">
-        <span :class="item.ip ? 'font-medium text-gray-900 dark:text-white' : 'text-gray-400'">
+        <span :class="{ 'text-lightInputPlaceholderText dark:text-darkInputPlaceholderText': !item.ip }">
           {{ item.ip || $t('Unknown') }}
         </span>
       </template>
@@ -57,14 +58,15 @@
       </template>
 
       <template #header:actions="{ column }">
-        <span class="flex justify-center">{{ column.label }}</span>
+        <span class="flex justify-end">{{ column.label }}</span>
       </template>
 
       <template #cell:actions="{ item }">
-        <div class="flex justify-center">
+        <div class="flex justify-end">
           <Button
             v-if="!item.isCurrent"
-            variant="danger"
+            variant="secondary"
+            size="sm"
             :loader="revokingId === item.sessionId"
             :disabled="revokingId === item.sessionId"
             @click="revoke(item)"
@@ -80,13 +82,8 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue';
 import { useI18n } from 'vue-i18n';
-import {
-  IconDesktopPcOutline,
-  IconMobilePhoneOutline,
-  IconQuestionCircleOutline,
-  IconTabletOutline,
-} from '@iconify-prerendered/vue-flowbite';
-import { Button, CountryFlag, Table } from '@/afcl';
+import { IconCircleQuestionMark, IconMonitor, IconSmartphone, IconTablet } from '@iconify-prerendered/vue-lucide';
+import { Button, CountryFlag, PageHeader, Table } from '@/afcl';
 import adminforth from '@/adminforth';
 import { callAdminForthApi, formatDateTime } from '@/utils';
 
@@ -107,14 +104,18 @@ type UserSession = {
 };
 
 const DEVICE_ICONS = {
-  desktop: IconDesktopPcOutline,
-  mobile: IconMobilePhoneOutline,
-  tablet: IconTabletOutline,
-  unknown: IconQuestionCircleOutline,
+  desktop: IconMonitor,
+  mobile: IconSmartphone,
+  tablet: IconTablet,
+  unknown: IconCircleQuestionMark,
 };
 
-/** Primary key of the user whose sessions are shown. Sessions of the logged in user when not set. */
-const props = defineProps<{ userPk?: string }>();
+const props = defineProps<{
+  title: string;
+  description: string;
+  /** Primary key of the user whose sessions are shown. Sessions of the logged in user when not set. */
+  userPk?: string;
+}>();
 
 const { t } = useI18n();
 
