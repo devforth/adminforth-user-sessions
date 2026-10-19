@@ -22,6 +22,7 @@ const REVOKE_REPEAT_DELAY_MS = 5000;
 const ENDPOINTS_PREFIX = '/plugin/user-sessions';
 // listing is done for one user only, so the limit is just a sanity cap
 const SESSIONS_LIST_LIMIT = 500;
+export const REVOKE_OTHERS_MAX_ROUNDS = 50;
 // real user agents are well under this; the header itself is client-controlled and can be ~16KB
 const USER_AGENT_MAX_LENGTH = 512;
 const COUNTRY_CODE_RE = /^[A-Z]{2}$/;
@@ -251,7 +252,9 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
         if (!await this.canManage(adminUser, userPk)) {
           return { allowed: false, sessions: [] };
         }
-        return { allowed: true, sessions: await this.listSessions(userPk, adminUser.sessionId) };
+        // session of the request belongs to the caller, so it is only "current" among their own
+        const ownSession = String(userPk) === String(adminUser.pk) ? adminUser.sessionId : undefined;
+        return { allowed: true, sessions: await this.listSessions(userPk, ownSession) };
       },
     });
 
@@ -281,10 +284,20 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
           return { error: 'Not allowed to manage sessions of this user' };
         }
         // session the request is made with survives, for another user it means all of their sessions go
-        const sessions = await this.listSessions(userPk, adminUser.sessionId);
-        const revoked = sessions.filter((session) => !session.isCurrent);
-        await Promise.all(revoked.map((session) => this.revokeSession(userPk, session.sessionId)));
-        return { ok: true, revoked: revoked.length };
+        const ownSession = String(userPk) === String(adminUser.pk) ? adminUser.sessionId : undefined;
+        const revoked = new Set<string>();
+        // listing is capped, so repeat until a round sees nothing but the current session
+        for (let round = 0; round < REVOKE_OTHERS_MAX_ROUNDS; round++) {
+          const others = (await this.listSessions(userPk, ownSession))
+            .filter((session) => !session.isCurrent);
+          if (!others.length) {
+            return { ok: true, revoked: revoked.size };
+          }
+          others.forEach((session) => revoked.add(session.sessionId));
+          await Promise.all(others.map((session) => this.revokeSession(userPk, session.sessionId)));
+        }
+        afLogger.error(`UserSessionsPlugin: gave up revoking sessions of ${userPk} after ${REVOKE_OTHERS_MAX_ROUNDS} rounds, ${revoked.size} revoked`);
+        return { ok: false, revoked: revoked.size };
       },
     });
   }
