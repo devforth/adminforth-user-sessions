@@ -1,4 +1,4 @@
-import type { AdminUser, KeyValueAdapter, PluginsCommonOptions } from "adminforth";
+import type { AdminUser, KeyValueAdapter, PeriodString, PluginsCommonOptions } from "adminforth";
 
 /**
  * What is stored in key-value adapter under `<user pk>:<session id>` key for every active session.
@@ -68,6 +68,69 @@ export interface RevokeTokenPayload {
   deviceId: string;
 }
 
+/**
+ * One IP in the `ips` column of a failed attempts record.
+ */
+export interface FailedLoginIp {
+  attempts: number;
+  country: string | null;
+}
+
+/**
+ * Names of columns in the login history resource.
+ *
+ * A sign-in is stored with `ip`, `country` and `user_agent`, `attempts` is 1 and `ips` is empty.
+ * Failed attempts of a user are stored as one record per {@link LoginHistoryOptions.failedLogsInterval}:
+ * `attempts` is their total and `ips` is a JSON object of {@link FailedLoginIp} by IP,
+ * `ip`, `country` and `user_agent` are empty.
+ */
+export interface LoginHistoryColumns {
+  /** Should be same type as primary key of users resource. */
+  userIdColumnName: string;
+  /** Boolean, `true` for a sign-in, `false` for failed attempts. */
+  successColumnName: string;
+  /** Integer. */
+  attemptsColumnName: string;
+  /** String. */
+  ipColumnName: string;
+  /** String, two-letter country code. */
+  countryColumnName: string;
+  /** String, at least 512 characters. */
+  userAgentColumnName: string;
+  /** JSON. Enable `filterOptions.substringSearch` on it to find records by IP. */
+  ipsColumnName: string;
+  /** Datetime. For failed attempts it is the time of the first attempt in the record. */
+  createdAtColumnName: string;
+}
+
+export interface LoginHistoryOptions {
+  /**
+   * Resource where sign-ins and failed sign-in attempts are stored.
+   */
+  resourceId: string;
+
+  /**
+   * Failed attempts are counted in memory and written as one record per user once per this period,
+   * so a bruteforce of any rate costs one write per attacked user. Default is `1m`.
+   * Attempts counted since the last write are lost on restart.
+   */
+  failedLogsInterval?: PeriodString;
+
+  /**
+   * How many IPs are kept in `ips` of one failed attempts record. Default is 100.
+   * Attempts from other IPs are still counted in `attempts`.
+   */
+  maxIpsPerLog?: number;
+
+  /**
+   * How many failed attempts records are kept for one user, older ones are deleted. Default is 100.
+   * Sign-ins are not limited, remove them by age with the auto-remove plugin.
+   */
+  maxFailedLogsPerUser?: number;
+
+  resourceColumns: LoginHistoryColumns;
+}
+
 export interface PluginOptions extends PluginsCommonOptions {
   /**
    * Adapter where active sessions are stored. Redis adapter is recommended: sessions must survive
@@ -116,4 +179,9 @@ export interface PluginOptions extends PluginsCommonOptions {
    * The callback is not awaited, so a slow handler doesn't delay the sign-in, its errors are logged.
    */
   onNewLogin?: (params: NewLoginParams) => Promise<void>;
+
+  /**
+   * Stores sign-ins and failed password attempts in a resource, see {@link LoginHistoryOptions}.
+   */
+  loginHistory?: LoginHistoryOptions;
 }

@@ -1,8 +1,9 @@
-import { AdminForthPlugin, afLogger } from "adminforth";
+import { AdminForthPlugin, afLogger, convertPeriodToSeconds, Filters, Sorts } from "adminforth";
 import type {
   AdminForthComponentDeclarationFull,
   AdminUser,
   AdminUserAuthorizeFunction,
+  AfterLoginFailedFunction,
   AfterSessionCreatedFunction,
   BeforeLogoutFunction,
   HttpExtra,
@@ -11,8 +12,10 @@ import type {
   KeyValueAdapter,
 } from "adminforth";
 import { z } from "zod";
+import { FailedLoginsBuffer } from "./failedLoginsBuffer.js";
 import type {
   KnownDeviceRecord,
+  LoginHistoryOptions,
   NewLoginReason,
   PluginOptions,
   RevokeTokenPayload,
@@ -39,6 +42,11 @@ const KNOWN_DEVICE_TTL_SECONDS = 2 * 365 * 24 * 60 * 60;
 const REVOKE_TOKEN_TYPE = 'userSessionRevoke';
 const REVOKE_PAGE_PATH = 'user-sessions/revoke';
 const INVALID_LINK_ERROR = 'Link is invalid or expired';
+const DEFAULT_FAILED_LOGS_INTERVAL = '1m';
+const DEFAULT_MAX_IPS_PER_LOG = 100;
+const DEFAULT_MAX_FAILED_LOGS_PER_USER = 100;
+// IPv6 is at most 45 characters; the IP comes from client-controlled headers and becomes a JSON key
+const IP_MAX_LENGTH = 64;
 
 const listBodySchema = z.object({
   userPk: z.string().optional(),
@@ -56,6 +64,7 @@ const tokenBodySchema = z.object({
 export default class UserSessionsPlugin extends AdminForthPlugin {
   options: PluginOptions;
   pluginsScope: 'global' = 'global';
+  private loginHistoryPkColumn?: string;
 
   constructor(options: PluginOptions) {
     super(options, import.meta.url);
@@ -80,11 +89,18 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
     (auth.afterSessionCreated as AfterSessionCreatedFunction[]).push(
       async ({ pk, username, sessionId, expiresInSeconds, extra }) => {
         const session = await this.storeSession(pk, sessionId, expiresInSeconds, extra);
+        if (this.options.loginHistory) {
+          await this.logSignIn(this.options.loginHistory, pk, session);
+        }
         if (this.options.onNewLogin && extra) {
           await this.trackDevice({ pk, username, sessionId, expiresInSeconds, extra, session });
         }
       }
     );
+
+    if (this.options.loginHistory) {
+      this.trackFailedLogins(this.options.loginHistory);
+    }
 
     // unshifted: a revoked session must be rejected before any other hook lets it do work
     (auth.adminUserAuthorize as AdminUserAuthorizeFunction[]).unshift(
@@ -126,6 +142,105 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
         path: `/${REVOKE_PAGE_PATH}`,
         component: { file: this.componentPath('RevokeSession.vue'), meta: { sidebarAndHeader: 'none' } },
       });
+    }
+  }
+
+  validateConfigAfterDiscover(adminforth: IAdminForth) {
+    const loginHistory = this.options.loginHistory;
+    if (!loginHistory) {
+      return;
+    }
+    const resource = adminforth.config.resources.find((res) => res.resourceId === loginHistory.resourceId);
+    if (!resource) {
+      throw new Error(`UserSessionsPlugin: loginHistory resource "${loginHistory.resourceId}" not found`);
+    }
+    for (const columnName of Object.values(loginHistory.resourceColumns)) {
+      if (!resource.columns.some((column) => column.name === columnName)) {
+        throw new Error(`UserSessionsPlugin: column "${columnName}" not found in loginHistory resource "${resource.resourceId}"`);
+      }
+    }
+    this.loginHistoryPkColumn = resource.columns.find((column) => column.primaryKey)!.name;
+  }
+
+  private async logSignIn(loginHistory: LoginHistoryOptions, pk: string | null, session: UserSessionRecord) {
+    const columns = loginHistory.resourceColumns;
+    const { error } = await this.adminforth.resource(loginHistory.resourceId).create({
+      [columns.userIdColumnName]: pk,
+      [columns.successColumnName]: true,
+      [columns.attemptsColumnName]: 1,
+      [columns.ipColumnName]: session.ip,
+      [columns.countryColumnName]: session.country,
+      [columns.userAgentColumnName]: session.user_agent,
+      [columns.createdAtColumnName]: session.created_at,
+    });
+    if (error) {
+      afLogger.error(`UserSessionsPlugin: failed to store sign-in in login history: ${error}`);
+    }
+  }
+
+  /**
+   * Counts failed password attempts in memory and writes them once per `failedLogsInterval`,
+   * so database load does not grow with the rate of a bruteforce.
+   */
+  private trackFailedLogins(loginHistory: LoginHistoryOptions) {
+    const auth = this.adminforth.config.auth!;
+    if (!auth.afterLoginFailed) {
+      throw new Error(
+        'User sessions plugin requires AdminForth which supports auth.afterLoginFailed hook to store login history, please update adminforth package'
+      );
+    }
+
+    const failedLogins = new FailedLoginsBuffer(loginHistory.maxIpsPerLog ?? DEFAULT_MAX_IPS_PER_LOG);
+    (auth.afterLoginFailed as AfterLoginFailedFunction[]).push(
+      async ({ pk, reason, extra }) => {
+        // unknown usernames are not stored: anyone could create records for them at will,
+        // and a mistyped username is often the password
+        if (reason !== 'invalid_password') {
+          return;
+        }
+        // typed as string, but private addresses (e.g. localhost) come as null
+        const ip = this.adminforth.auth.getClientIp(extra.headers)?.slice(0, IP_MAX_LENGTH) ?? null;
+        await failedLogins.add(pk!, ip, () => this.resolveCountry(ip, extra.headers));
+      }
+    );
+
+    const intervalMs = convertPeriodToSeconds(loginHistory.failedLogsInterval ?? DEFAULT_FAILED_LOGS_INTERVAL) * 1000;
+    setInterval(() => {
+      this.storeFailedLogins(loginHistory, failedLogins).catch((e) => {
+        afLogger.error(`UserSessionsPlugin: failed to store failed login attempts: ${e}`);
+      });
+    }, intervalMs).unref();
+  }
+
+  /**
+   * Writes one record per user with counted attempts, then deletes failed attempts records of the user
+   * above `maxFailedLogsPerUser`.
+   */
+  private async storeFailedLogins(loginHistory: LoginHistoryOptions, failedLogins: FailedLoginsBuffer) {
+    const columns = loginHistory.resourceColumns;
+    const resource = this.adminforth.resource(loginHistory.resourceId);
+    const pkColumn = this.loginHistoryPkColumn!;
+
+    for (const [pk, userLogins] of failedLogins.drain()) {
+      const { error } = await resource.create({
+        [columns.userIdColumnName]: pk,
+        [columns.successColumnName]: false,
+        [columns.attemptsColumnName]: userLogins.attempts,
+        [columns.ipsColumnName]: Object.fromEntries(userLogins.ips),
+        [columns.createdAtColumnName]: userLogins.first_attempt_at,
+      });
+      if (error) {
+        afLogger.error(`UserSessionsPlugin: failed to store failed login attempts of user ${pk}: ${error}`);
+      }
+
+      const outdated = await resource.list(
+        [Filters.EQ(columns.userIdColumnName, pk), Filters.EQ(columns.successColumnName, false)],
+        undefined,
+        loginHistory.maxFailedLogsPerUser ?? DEFAULT_MAX_FAILED_LOGS_PER_USER,
+        Sorts.DESC(columns.createdAtColumnName),
+        [pkColumn],
+      );
+      await Promise.all(outdated.map((record) => resource.delete(record[pkColumn])));
     }
   }
 

@@ -17,7 +17,15 @@ const adminforthMock = vi.hoisted(() => {
     }
   }
 
-  return { AdminForthPlugin, afLogger: { error: vi.fn() } };
+  const PERIOD_SECONDS: Record<string, number> = { s: 1, m: 60, h: 3600, d: 86400 };
+
+  return {
+    AdminForthPlugin,
+    afLogger: { error: vi.fn() },
+    convertPeriodToSeconds: (period: string) => Number(period.slice(0, -1)) * PERIOD_SECONDS[period.slice(-1)],
+    Filters: { EQ: (field: string, value: any) => ({ field, value }) },
+    Sorts: { DESC: (field: string) => ({ field, direction: 'desc' }) },
+  };
 });
 
 vi.mock('adminforth', () => adminforthMock);
@@ -53,22 +61,66 @@ class MemoryKeyValueAdapter {
   }
 }
 
+class MemoryResource {
+  records: Record<string, any>[] = [];
+  private nextId = 1;
+
+  async create(record: Record<string, any>) {
+    this.records.push({ id: this.nextId++, ...record });
+    return { ok: true, createdRecord: record };
+  }
+
+  async list(filters: { field: string, value: any }[], _limit: number | undefined, offset: number, sort: { field: string }) {
+    return this.records
+      .filter((record) => filters.every(({ field, value }) => record[field] === value))
+      .sort((a, b) => b[sort.field].localeCompare(a[sort.field]))
+      .slice(offset);
+  }
+
+  async delete(id: number) {
+    this.records = this.records.filter((record) => record.id !== id);
+    return true;
+  }
+}
+
+const LOGIN_HISTORY = {
+  resourceId: 'login_history',
+  resourceColumns: {
+    userIdColumnName: 'user_id',
+    successColumnName: 'success',
+    attemptsColumnName: 'attempts',
+    ipColumnName: 'ip',
+    countryColumnName: 'country',
+    userAgentColumnName: 'user_agent',
+    ipsColumnName: 'ips',
+    createdAtColumnName: 'created_at',
+  },
+};
+
 const USER = { pk: 'user-1', username: 'adminforth', dbUser: {} };
 const CHROME_MAC_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 const HEADERS = { 'x-forwarded-for': '8.8.8.8', 'cf-ipcountry': 'DE', 'user-agent': CHROME_MAC_UA };
 const DEVICE_COOKIE = 'adminforth_test_device';
 
 function createAdminforth() {
+  const loginHistory = new MemoryResource();
   return {
+    loginHistory,
+    resource: () => loginHistory,
     config: {
       resources: [{
         resourceId: 'adminuser',
         columns: [{ name: 'id', primaryKey: true }],
         options: {},
+      }, {
+        resourceId: 'login_history',
+        columns: [{ name: 'id', primaryKey: true }, ...Object.values(LOGIN_HISTORY.resourceColumns).map((name) => ({ name }))],
+        options: {},
       }] as any[],
       auth: {
         usersResourceId: 'adminuser',
         afterSessionCreated: [] as any[],
+        afterLoginFailed: [] as any[],
         adminUserAuthorize: [] as any[],
         beforeLogout: [] as any[],
         userMenuSettingsPages: undefined as any,
@@ -858,5 +910,182 @@ describe('new login notifications', () => {
       expect(await kv.get(`${USER.pk}:first-session`, 'adminforth-user-sessions')).not.toBeNull();
       expect(knownDevice(deviceId)).toBeUndefined();
     });
+  });
+});
+
+describe('login history', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function activateWithHistory(options: Record<string, any> = {}, pluginOptions: Record<string, any> = {}) {
+    const plugin = activate({ ...pluginOptions, loginHistory: { ...LOGIN_HISTORY, ...options } });
+    plugin.validateConfigAfterDiscover(adminforth as any);
+    return plugin;
+  }
+
+  async function failLogin(ip: string, reason = 'invalid_password', pk: string | null = USER.pk) {
+    await adminforth.config.auth.afterLoginFailed[0]({
+      username: USER.username,
+      pk,
+      reason,
+      adminforth,
+      extra: extraOf({ ...HEADERS, 'x-forwarded-for': ip }),
+    });
+  }
+
+  const nextInterval = () => vi.advanceTimersByTimeAsync(60_000);
+  const failedRecords = () => adminforth.loginHistory.records.filter((record) => !record.success);
+
+  it('stores failed attempts only when the option is set', () => {
+    activate();
+
+    expect(adminforth.config.auth.afterLoginFailed).toHaveLength(0);
+  });
+
+  it('refuses to store login history with adminforth which has no afterLoginFailed hook', () => {
+    delete (adminforth.config.auth as any).afterLoginFailed;
+
+    expect(() => activate({ loginHistory: LOGIN_HISTORY })).toThrow(/afterLoginFailed/);
+  });
+
+  it('refuses a resource without a configured column', () => {
+    adminforth.config.resources[1].columns = adminforth.config.resources[1].columns.filter((column: any) => column.name !== 'ips');
+
+    expect(() => activateWithHistory()).toThrow(/column "ips" not found/);
+  });
+
+  it('stores sign-in right away with ip, country and user agent', async () => {
+    activateWithHistory();
+    await login('session-1');
+
+    expect(adminforth.loginHistory.records).toEqual([{
+      id: 1,
+      user_id: USER.pk,
+      success: true,
+      attempts: 1,
+      ip: '8.8.8.8',
+      country: 'DE',
+      user_agent: CHROME_MAC_UA,
+      created_at: expect.any(String),
+    }]);
+  });
+
+  it('writes attempts from different IPs of an interval as one record', async () => {
+    activateWithHistory();
+    for (let i = 1; i <= 10; i++) {
+      await failLogin(`10.0.0.${i}`);
+    }
+
+    expect(failedRecords()).toEqual([]);
+
+    await nextInterval();
+
+    expect(failedRecords()).toHaveLength(1);
+    expect(failedRecords()[0]).toEqual({
+      id: 1,
+      user_id: USER.pk,
+      success: false,
+      attempts: 10,
+      ips: Object.fromEntries(Array.from({ length: 10 }, (_, i) => [`10.0.0.${i + 1}`, { attempts: 1, country: 'DE' }])),
+      created_at: expect.any(String),
+    });
+  });
+
+  it('counts repeated attempts from an IP and resolves its country once', async () => {
+    const resolveCountry = vi.fn(async () => 'FR');
+    activateWithHistory({}, { countryHeader: '', resolveCountry });
+    for (let i = 0; i < 5; i++) {
+      await failLogin('10.0.0.1');
+    }
+    await nextInterval();
+
+    expect(failedRecords()[0].ips).toEqual({ '10.0.0.1': { attempts: 5, country: 'FR' } });
+    expect(resolveCountry).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps maxIpsPerLog IPs in a record and still counts attempts from the rest', async () => {
+    activateWithHistory({ maxIpsPerLog: 2 });
+    await failLogin('10.0.0.1');
+    await failLogin('10.0.0.2');
+    await failLogin('10.0.0.3');
+    await failLogin('10.0.0.1');
+    await nextInterval();
+
+    expect(failedRecords()[0].attempts).toEqual(4);
+    expect(Object.keys(failedRecords()[0].ips)).toEqual(['10.0.0.1', '10.0.0.2']);
+  });
+
+  it('truncates an oversized IP from client headers', async () => {
+    activateWithHistory();
+    await failLogin('1'.repeat(1000));
+    await nextInterval();
+
+    expect(Object.keys(failedRecords()[0].ips)[0]).toHaveLength(64);
+  });
+
+  it('counts attempts from an unknown IP without adding it to ips', async () => {
+    activateWithHistory();
+    await adminforth.config.auth.afterLoginFailed[0]({
+      username: USER.username,
+      pk: USER.pk,
+      reason: 'invalid_password',
+      adminforth,
+      extra: extraOf({ 'user-agent': CHROME_MAC_UA }),
+    });
+    await failLogin('10.0.0.1');
+    await nextInterval();
+
+    expect(failedRecords()[0].attempts).toEqual(2);
+    expect(failedRecords()[0].ips).toEqual({ '10.0.0.1': { attempts: 1, country: 'DE' } });
+  });
+
+  it('does not store attempts with unknown username or rejected before credentials check', async () => {
+    activateWithHistory();
+    await failLogin('10.0.0.1', 'user_not_found', null);
+    await failLogin('10.0.0.1', 'rejected', null);
+    await nextInterval();
+
+    expect(failedRecords()).toEqual([]);
+  });
+
+  it('writes a record per interval with attempts and nothing for an interval without them', async () => {
+    activateWithHistory();
+    await failLogin('10.0.0.1');
+    await nextInterval();
+    await nextInterval();
+    await failLogin('10.0.0.1');
+    await failLogin('10.0.0.1');
+    await nextInterval();
+
+    expect(failedRecords().map((record) => record.attempts)).toEqual([1, 2]);
+  });
+
+  it('honors failedLogsInterval', async () => {
+    activateWithHistory({ failedLogsInterval: '5m' });
+    await failLogin('10.0.0.1');
+    await nextInterval();
+
+    expect(failedRecords()).toEqual([]);
+
+    await vi.advanceTimersByTimeAsync(4 * 60_000);
+
+    expect(failedRecords()).toHaveLength(1);
+  });
+
+  it('keeps maxFailedLogsPerUser newest failed records of a user and all sign-ins', async () => {
+    activateWithHistory({ maxFailedLogsPerUser: 2 });
+    await login('session-1');
+    for (let i = 1; i <= 3; i++) {
+      await failLogin(`10.0.0.${i}`);
+      await nextInterval();
+    }
+
+    expect(failedRecords().map((record) => Object.keys(record.ips))).toEqual([['10.0.0.2'], ['10.0.0.3']]);
+    expect(adminforth.loginHistory.records.filter((record) => record.success)).toHaveLength(1);
   });
 });
