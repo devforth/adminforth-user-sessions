@@ -39,11 +39,11 @@ function named(name: string, match: RegExpExecArray): string {
   return match[1] ? `${name} ${match[1]}` : name;
 }
 
-function firstMatch(userAgent: string, candidates: { name: string, re: RegExp }[]): string | null {
+function firstMatch(userAgent: string, candidates: { name: string, re: RegExp }[], withVersion: boolean): string | null {
   for (const { name, re } of candidates) {
     const match = re.exec(userAgent);
     if (match) {
-      return named(name, match);
+      return withVersion ? named(name, match) : name;
     }
   }
   return null;
@@ -59,14 +59,16 @@ function deviceType(userAgent: string): SessionDevice['type'] {
 /**
  * Returns null when there is nothing to parse: sessions created before this plugin started storing
  * the user agent, and clients which send no `User-Agent` header at all.
+ * Without versions (`Chrome`, `iOS`) the result tells whether two sign-ins came from the same browser,
+ * whose versions change with every update.
  */
-export function parseUserAgent(userAgent: string | null | undefined): SessionDevice | null {
+export function parseUserAgent(userAgent: string | null | undefined, withVersions = true): SessionDevice | null {
   if (!userAgent) {
     return null;
   }
   return {
-    browser: firstMatch(userAgent, BROWSERS),
-    os: firstMatch(userAgent, OSES),
+    browser: firstMatch(userAgent, BROWSERS, withVersions),
+    os: firstMatch(userAgent, OSES, withVersions),
     type: deviceType(userAgent),
   };
 }

@@ -11,7 +11,15 @@ import type {
   KeyValueAdapter,
 } from "adminforth";
 import { z } from "zod";
-import type { PluginOptions, UserSessionListItem, UserSessionRecord } from "./types.js";
+import type {
+  KnownDeviceRecord,
+  NewLoginReason,
+  PluginOptions,
+  RevokeTokenPayload,
+  SessionDevice,
+  UserSessionListItem,
+  UserSessionRecord,
+} from "./types.js";
 import { parseUserAgent } from "./userAgent.js";
 
 const DEFAULT_COLLECTION = 'adminforth-user-sessions';
@@ -21,10 +29,16 @@ const DEFAULT_LAST_USED_THROTTLE_SECONDS = 60;
 const REVOKE_REPEAT_DELAY_MS = 5000;
 const ENDPOINTS_PREFIX = '/plugin/user-sessions';
 // listing is done for one user only, so the limit is just a sanity cap
-const SESSIONS_LIST_LIMIT = 500;
+const PER_USER_LIST_LIMIT = 500;
 // real user agents are well under this; the header itself is client-controlled and can be ~16KB
 const USER_AGENT_MAX_LENGTH = 512;
 const COUNTRY_CODE_RE = /^[A-Z]{2}$/;
+const DEVICE_COOKIE = 'device';
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const KNOWN_DEVICE_TTL_SECONDS = 2 * 365 * 24 * 60 * 60;
+const REVOKE_TOKEN_TYPE = 'userSessionRevoke';
+const REVOKE_PAGE_PATH = 'user-sessions/revoke';
+const INVALID_LINK_ERROR = 'Link is invalid or expired';
 
 const listBodySchema = z.object({
   userPk: z.string().optional(),
@@ -33,6 +47,10 @@ const listBodySchema = z.object({
 const revokeBodySchema = z.object({
   sessionId: z.string(),
   userPk: z.string().optional(),
+}).strict();
+
+const tokenBodySchema = z.object({
+  token: z.string(),
 }).strict();
 
 export default class UserSessionsPlugin extends AdminForthPlugin {
@@ -60,8 +78,11 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
     }
 
     (auth.afterSessionCreated as AfterSessionCreatedFunction[]).push(
-      async ({ pk, sessionId, expiresInSeconds, extra }) => {
-        await this.storeSession(pk, sessionId, expiresInSeconds, extra);
+      async ({ pk, username, sessionId, expiresInSeconds, extra }) => {
+        const session = await this.storeSession(pk, sessionId, expiresInSeconds, extra);
+        if (this.options.onNewLogin && extra) {
+          await this.trackDevice({ pk, username, sessionId, expiresInSeconds, extra, session });
+        }
       }
     );
 
@@ -97,6 +118,14 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
 
     if (this.options.canManageOtherUsersSessions) {
       this.showSessionsOnUsersResource(adminforth, auth.usersResourceId!);
+    }
+
+    if (this.options.onNewLogin) {
+      // opened from a notification, so it must work without signing in
+      adminforth.config.customization.customPages.push({
+        path: `/${REVOKE_PAGE_PATH}`,
+        component: { file: this.componentPath('RevokeSession.vue'), meta: { sidebarAndHeader: 'none' } },
+      });
     }
   }
 
@@ -140,7 +169,13 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
     return this.options.collection ?? DEFAULT_COLLECTION;
   }
 
-  private async storeSession(pk: string | null, sessionId: string, expiresInSeconds: number, extra?: HttpExtra) {
+  private get devicesCollection(): string {
+    return `${this.collection}-devices`;
+  }
+
+  private async storeSession(
+    pk: string | null, sessionId: string, expiresInSeconds: number, extra?: HttpExtra,
+  ): Promise<UserSessionRecord> {
     const headers = extra?.headers ?? {};
     const ip = extra ? this.adminforth.auth.getClientIp(headers) : null;
     const now = new Date().toISOString();
@@ -151,7 +186,77 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
       created_at: now,
       last_used_at: now,
     };
-    await this.kv.set(sessionKey(pk, sessionId), JSON.stringify(record), expiresInSeconds, this.collection);
+    await this.kv.set(userKey(pk, sessionId), JSON.stringify(record), expiresInSeconds, this.collection);
+    return record;
+  }
+
+  /**
+   * Recognizes the browser by a long-lived device cookie and reports the sign-in when the device or
+   * the country is new for the user. The first sign-in of a user is reported too, its device is new.
+   */
+  private async trackDevice({ pk, username, sessionId, expiresInSeconds, extra, session }: {
+    pk: string | null,
+    username: string,
+    sessionId: string,
+    expiresInSeconds: number,
+    extra: HttpExtra,
+    session: UserSessionRecord,
+  }) {
+    const auth = this.adminforth.auth;
+    const cookie = auth.getCustomCookie({ cookies: extra.cookies, name: DEVICE_COOKIE });
+    // the cookie comes from the client, a malformed one is replaced like a missing one
+    const deviceId = cookie && UUID_RE.test(cookie) ? cookie : crypto.randomUUID();
+    // set again on every sign-in: browsers cap cookie lifetime, Chromium at 400 days
+    auth.setCustomCookie({
+      response: extra.response,
+      payload: { name: DEVICE_COOKIE, value: deviceId, expirySeconds: KNOWN_DEVICE_TTL_SECONDS, httpOnly: true },
+    });
+
+    const knownDevices = await this.listOfUser<KnownDeviceRecord>(pk, this.devicesCollection);
+    const device = parseUserAgent(session.user_agent, false);
+    const known = knownDevices.find(([id]) => id === deviceId)?.[1];
+    // a known cookie in another browser was copied there, so the device is not the known one
+    const previous = known && isSameDevice(known.device, device) ? known : undefined;
+    const { country } = session;
+
+    const reasons: NewLoginReason[] = [];
+    if (!previous) {
+      reasons.push('new_device');
+    }
+    if (country && !knownDevices.some(([, record]) => record.countries.includes(country))) {
+      reasons.push('new_country');
+    }
+
+    const countries = previous?.countries ?? [];
+    const now = new Date().toISOString();
+    const record: KnownDeviceRecord = {
+      device,
+      countries: country && !countries.includes(country) ? [...countries, country] : countries,
+      first_seen: previous?.first_seen ?? now,
+      last_seen: now,
+    };
+    await this.kv.set(userKey(pk, deviceId), JSON.stringify(record), KNOWN_DEVICE_TTL_SECONDS, this.devicesCollection);
+
+    if (!reasons.length) {
+      return;
+    }
+
+    const tokenPayload: RevokeTokenPayload = { pk, sessionId, deviceId };
+    const token = auth.issueJWT(tokenPayload, REVOKE_TOKEN_TYPE, expiresInSeconds);
+    // not awaited: a slow handler (e.g. a request to Slack) must not delay the sign-in
+    this.options.onNewLogin!({
+      pk,
+      username,
+      session: { ...session, sessionId, device: parseUserAgent(session.user_agent) },
+      reasons,
+      revokePath: `${this.adminforth.config.baseUrlSlashed}${REVOKE_PAGE_PATH}?token=${token}`,
+    }).catch((e) => {
+      afLogger.error(`UserSessionsPlugin: onNewLogin failed: ${e}`);
+    });
+  }
+
+  private async verifyRevokeToken(token: string): Promise<RevokeTokenPayload | null> {
+    return await this.adminforth.auth.verify(token, REVOKE_TOKEN_TYPE, false) as RevokeTokenPayload | null;
   }
 
   /**
@@ -159,7 +264,7 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
    * right before the first delete may still write it back while refreshing `last_used_at`.
    */
   private async revokeSession(pk: string | null, sessionId: string) {
-    const key = sessionKey(pk, sessionId);
+    const key = userKey(pk, sessionId);
     await this.kv.delete(key, this.collection);
     setTimeout(() => {
       this.kv.delete(key, this.collection).catch((e) => {
@@ -190,7 +295,7 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
       return { allowed: true };
     }
 
-    const key = sessionKey(adminUser.pk, adminUser.sessionId);
+    const key = userKey(adminUser.pk, adminUser.sessionId);
     const stored = await this.kv.get(key, this.collection);
     if (!stored) {
       return { allowed: false, error: 'Session was revoked' };
@@ -223,21 +328,27 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
     );
   }
 
-  private async listSessions(userPk: string | null, currentSessionId?: string): Promise<UserSessionListItem[]> {
-    const rows = await this.kv.listByPrefix(`${userPk}:`, SESSIONS_LIST_LIMIT, this.collection);
+  /**
+   * Records of one user in the collection as `[id, record]` pairs, keys there are `<user pk>:<id>`.
+   */
+  private async listOfUser<T>(pk: string | null, collection: string): Promise<[string, T][]> {
+    const rows = await this.kv.listByPrefix(`${pk}:`, PER_USER_LIST_LIMIT, collection);
+    return rows.map((row) => {
+      const [key] = Object.keys(row);
+      return [key.slice(key.lastIndexOf(':') + 1), JSON.parse(row[key]) as T];
+    });
+  }
 
-    return rows
-      .map((row) => {
-        const [key] = Object.keys(row);
-        const sessionId = key.slice(key.lastIndexOf(':') + 1);
-        const record = JSON.parse(row[key]) as UserSessionRecord;
-        return {
-          ...record,
-          sessionId,
-          isCurrent: sessionId === currentSessionId,
-          device: parseUserAgent(record.user_agent),
-        };
-      })
+  private async listSessions(userPk: string | null, currentSessionId?: string): Promise<UserSessionListItem[]> {
+    const records = await this.listOfUser<UserSessionRecord>(userPk, this.collection);
+
+    return records
+      .map(([sessionId, record]) => ({
+        ...record,
+        sessionId,
+        isCurrent: sessionId === currentSessionId,
+        device: parseUserAgent(record.user_agent),
+      }))
       .sort((a, b) => b.created_at.localeCompare(a.created_at));
   }
 
@@ -287,9 +398,56 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
         return { ok: true, revoked: revoked.length };
       },
     });
+
+    // endpoints of the page linked from onNewLogin notifications: the token is the only credential there
+    server.endpoint({
+      method: 'POST',
+      path: `${ENDPOINTS_PREFIX}/session-by-token`,
+      noAuth: true,
+      agent: { hiddenFromAgents: true },
+      request_schema: tokenBodySchema,
+      handler: async ({ body, response }) => {
+        const token = await this.verifyRevokeToken(body.token);
+        if (!token) {
+          response.setStatus(400);
+          return { error: INVALID_LINK_ERROR };
+        }
+        const stored = await this.kv.get(userKey(token.pk, token.sessionId), this.collection);
+        if (!stored) {
+          return { session: null };
+        }
+        const { ip, country, user_agent, created_at } = JSON.parse(stored) as UserSessionRecord;
+        return { session: { ip, country, created_at, device: parseUserAgent(user_agent) } };
+      },
+    });
+
+    server.endpoint({
+      method: 'POST',
+      path: `${ENDPOINTS_PREFIX}/revoke-by-token`,
+      noAuth: true,
+      agent: { hiddenFromAgents: true },
+      request_schema: tokenBodySchema,
+      handler: async ({ body, response }) => {
+        const token = await this.verifyRevokeToken(body.token);
+        if (!token) {
+          response.setStatus(400);
+          return { error: INVALID_LINK_ERROR };
+        }
+        await Promise.all([
+          this.revokeSession(token.pk, token.sessionId),
+          // the device is not trusted anymore, so the next sign-in from it is reported again
+          this.kv.delete(userKey(token.pk, token.deviceId), this.devicesCollection),
+        ]);
+        return { ok: true };
+      },
+    });
   }
 }
 
-function sessionKey(pk: string | null, sessionId: string): string {
-  return `${pk}:${sessionId}`;
+function userKey(pk: string | null, id: string): string {
+  return `${pk}:${id}`;
+}
+
+function isSameDevice(a: SessionDevice | null, b: SessionDevice | null): boolean {
+  return a?.browser === b?.browser && a?.os === b?.os && a?.type === b?.type;
 }

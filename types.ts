@@ -31,6 +31,43 @@ export interface UserSessionListItem extends UserSessionRecord {
   device: SessionDevice | null;
 }
 
+/**
+ * What is stored in key-value adapter under `<user pk>:<device id>` key for every device the user signed in from.
+ * Device id is a random id kept in a long-lived cookie of the browser.
+ */
+export interface KnownDeviceRecord {
+  /** Browser and OS without versions, so a browser update does not make the device look new. */
+  device: SessionDevice | null;
+  /** Every country the user signed in from on this device. */
+  countries: string[];
+  first_seen: string;
+  last_seen: string;
+}
+
+export type NewLoginReason = 'new_device' | 'new_country';
+
+export interface NewLoginParams {
+  pk: string | null;
+  username: string;
+  session: Omit<UserSessionListItem, 'isCurrent'>;
+  reasons: NewLoginReason[];
+  /**
+   * Path of the page where the user sees this sign-in and can end the session, with a token in the query.
+   * It starts with `baseUrl` of the app, prepend the origin of your admin panel to make a link:
+   * the origin of the sign-in request is controlled by whoever signed in, so the plugin doesn't use it.
+   */
+  revokePath: string;
+}
+
+/**
+ * Payload of the token in {@link NewLoginParams.revokePath}.
+ */
+export interface RevokeTokenPayload {
+  pk: string | null;
+  sessionId: string;
+  deviceId: string;
+}
+
 export interface PluginOptions extends PluginsCommonOptions {
   /**
    * Adapter where active sessions are stored. Redis adapter is recommended: sessions must survive
@@ -70,4 +107,13 @@ export interface PluginOptions extends PluginsCommonOptions {
    * "last used" at cost of more writes.
    */
   lastUsedThrottleSeconds?: number;
+
+  /**
+   * Called after a sign-in from a device or a country the user has not signed in from before, e.g. to
+   * notify the user in email or Slack. The first sign-in of a user is reported as well.
+   *
+   * Devices are recognized by a long-lived cookie and are tracked only while the option is set.
+   * The callback is not awaited, so a slow handler doesn't delay the sign-in, its errors are logged.
+   */
+  onNewLogin?: (params: NewLoginParams) => Promise<void>;
 }

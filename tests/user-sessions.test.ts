@@ -56,6 +56,7 @@ class MemoryKeyValueAdapter {
 const USER = { pk: 'user-1', username: 'adminforth', dbUser: {} };
 const CHROME_MAC_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 const HEADERS = { 'x-forwarded-for': '8.8.8.8', 'cf-ipcountry': 'DE', 'user-agent': CHROME_MAC_UA };
+const DEVICE_COOKIE = 'adminforth_test_device';
 
 function createAdminforth() {
   return {
@@ -72,15 +73,36 @@ function createAdminforth() {
         beforeLogout: [] as any[],
         userMenuSettingsPages: undefined as any,
       },
+      customization: {
+        customPages: [] as any[],
+      },
+      baseUrlSlashed: '/admin/',
     },
     auth: {
       getClientIp: (headers: Record<string, string>) => headers['x-forwarded-for'] ?? null,
+      getCustomCookie: ({ cookies, name }: any) =>
+        cookies.find((cookie: any) => cookie.key === `adminforth_test_${name}`)?.value ?? null,
+      setCustomCookie: ({ response, payload }: any) => { response.cookies.push(payload); },
+      // readable stand-in for a signed JWT, verify rejects tokens of other types like the real one
+      issueJWT: (payload: object, type: string) => Buffer.from(JSON.stringify({ ...payload, t: type })).toString('base64url'),
+      verify: async (token: string, type: string) => {
+        try {
+          const decoded = JSON.parse(Buffer.from(token, 'base64url').toString());
+          return decoded.t === type ? decoded : null;
+        } catch {
+          return null;
+        }
+      },
     },
   };
 }
 
-function extraOf(headers: Record<string, string> = HEADERS) {
-  return { headers } as any;
+function extraOf(headers: Record<string, string> = HEADERS, deviceId?: string) {
+  return {
+    headers,
+    cookies: deviceId ? [{ key: DEVICE_COOKIE, value: deviceId }] : [],
+    response: { cookies: [] as any[] },
+  } as any;
 }
 
 let kv: MemoryKeyValueAdapter;
@@ -113,15 +135,17 @@ function endpointsOf(plugin: any) {
   return registered;
 }
 
-async function login(sessionId: string, expiresInSeconds = 3600, headers = HEADERS) {
+async function login(sessionId: string, expiresInSeconds = 3600, headers: Record<string, string> = HEADERS, deviceId?: string) {
+  const extra = extraOf(headers, deviceId);
   await hooks().sessionCreated({
     pk: USER.pk,
     username: USER.username,
     sessionId,
     expiresInSeconds,
     adminforth,
-    extra: extraOf(headers),
+    extra,
   });
+  return extra;
 }
 
 function storedSession(sessionId: string) {
@@ -438,6 +462,10 @@ describe('user agent parsing', () => {
   it('gives nothing for a missing user agent', () => {
     expect(parseUserAgent(null)).toBeNull();
   });
+
+  it('leaves versions out when asked', () => {
+    expect(parseUserAgent(CHROME_MAC_UA, false)).toEqual({ browser: 'Chrome', os: 'macOS', type: 'desktop' });
+  });
 });
 
 describe('endpoints', () => {
@@ -602,5 +630,233 @@ describe('sessions of other users', () => {
     expect(await kv.get(`${USER.pk}:their-first`, 'adminforth-user-sessions')).toBeNull();
     expect(await kv.get(`${USER.pk}:their-second`, 'adminforth-user-sessions')).toBeNull();
     expect(await kv.get(`${SUPERADMIN.pk}:${SUPERADMIN.sessionId}`, 'adminforth-user-sessions')).not.toBeNull();
+  });
+});
+
+describe('new login notifications', () => {
+  const FIREFOX_LINUX_UA = 'Mozilla/5.0 (X11; Linux x86_64; rv:133.0) Gecko/20100101 Firefox/133.0';
+  const DEVICES_COLLECTION = 'adminforth-user-sessions-devices';
+
+  function deviceCookieOf(extra: any) {
+    return extra.response.cookies.find((cookie: any) => cookie.name === 'device');
+  }
+
+  function knownDevice(deviceId: string) {
+    const entry = kv.entries.get(`${DEVICES_COLLECTION}:${USER.pk}:${deviceId}`);
+    return entry && JSON.parse(entry.value);
+  }
+
+  /**
+   * Signs in once from a new browser, so the user has a known device and later sign-ins are compared with it.
+   * Mocks are cleared, so only the later sign-ins are seen by the callback.
+   */
+  async function firstLogin() {
+    const extra = await login('first-session');
+    vi.clearAllMocks();
+    return deviceCookieOf(extra).value as string;
+  }
+
+  function tokenOf(revokePath: string) {
+    return new URL(revokePath, 'https://admin.example.com').searchParams.get('token')!;
+  }
+
+  it('registers the revoke page only when the callback is set', () => {
+    activate();
+    expect(adminforth.config.customization.customPages).toEqual([]);
+
+    adminforth = createAdminforth();
+    activate({ onNewLogin: vi.fn(async () => {}) });
+    expect(adminforth.config.customization.customPages).toEqual([{
+      path: '/user-sessions/revoke',
+      component: { file: 'component:RevokeSession.vue', meta: { sidebarAndHeader: 'none' } },
+    }]);
+  });
+
+  it('does not track devices without the callback', async () => {
+    activate();
+    const extra = await login('session-1');
+
+    expect(extra.response.cookies).toEqual([]);
+    expect([...kv.entries.keys()].some((key) => key.startsWith(DEVICES_COLLECTION))).toBe(false);
+  });
+
+  it('reports the first sign-in of a user, remembering its device', async () => {
+    const onNewLogin = vi.fn(async () => {});
+    activate({ onNewLogin });
+
+    const extra = await login('session-1');
+
+    const cookie = deviceCookieOf(extra);
+    expect(cookie).toEqual({
+      name: 'device',
+      value: expect.stringMatching(/^[0-9a-f-]{36}$/),
+      expirySeconds: 2 * 365 * 24 * 60 * 60,
+      httpOnly: true,
+    });
+    expect(knownDevice(cookie.value)).toEqual({
+      device: { browser: 'Chrome', os: 'macOS', type: 'desktop' },
+      countries: ['DE'],
+      first_seen: expect.any(String),
+      last_seen: expect.any(String),
+    });
+    expect(onNewLogin).toHaveBeenCalledWith(expect.objectContaining({ reasons: ['new_device', 'new_country'] }));
+  });
+
+  it('does not report a sign-in from a known device and country, renewing the cookie', async () => {
+    const onNewLogin = vi.fn(async () => {});
+    activate({ onNewLogin });
+    const deviceId = await firstLogin();
+
+    const extra = await login('session-2', 3600, HEADERS, deviceId);
+
+    expect(onNewLogin).not.toHaveBeenCalled();
+    expect(deviceCookieOf(extra).value).toEqual(deviceId);
+  });
+
+  it('does not report a browser update', async () => {
+    const onNewLogin = vi.fn(async () => {});
+    activate({ onNewLogin });
+    const deviceId = await firstLogin();
+
+    await login('session-2', 3600, { ...HEADERS, 'user-agent': CHROME_MAC_UA.replace('Chrome/131', 'Chrome/140') }, deviceId);
+
+    expect(onNewLogin).not.toHaveBeenCalled();
+  });
+
+  it('reports a browser without the device cookie as a new device', async () => {
+    const onNewLogin = vi.fn(async () => {});
+    activate({ onNewLogin });
+    await firstLogin();
+
+    await login('session-2', 900);
+
+    expect(onNewLogin).toHaveBeenCalledWith({
+      pk: USER.pk,
+      username: USER.username,
+      session: expect.objectContaining({
+        sessionId: 'session-2',
+        ip: '8.8.8.8',
+        country: 'DE',
+        device: { browser: 'Chrome 131', os: 'macOS', type: 'desktop' },
+      }),
+      reasons: ['new_device'],
+      revokePath: expect.stringMatching(/^\/admin\/user-sessions\/revoke\?token=/),
+    });
+  });
+
+  it('reports a new country of a known device, remembering it', async () => {
+    const onNewLogin = vi.fn(async () => {});
+    activate({ onNewLogin });
+    const deviceId = await firstLogin();
+
+    await login('session-2', 3600, { ...HEADERS, 'cf-ipcountry': 'FR' }, deviceId);
+    await login('session-3', 3600, HEADERS, deviceId);
+
+    expect(onNewLogin).toHaveBeenCalledTimes(1);
+    expect(onNewLogin).toHaveBeenCalledWith(expect.objectContaining({ reasons: ['new_country'] }));
+    expect(knownDevice(deviceId).countries).toEqual(['DE', 'FR']);
+  });
+
+  it('skips the country check when the country is unknown', async () => {
+    const onNewLogin = vi.fn(async () => {});
+    activate({ onNewLogin });
+    const deviceId = await firstLogin();
+
+    await login('session-2', 3600, { 'x-forwarded-for': '8.8.8.8', 'user-agent': CHROME_MAC_UA }, deviceId);
+
+    expect(onNewLogin).not.toHaveBeenCalled();
+  });
+
+  it('reports a known device cookie copied into another browser as a new device', async () => {
+    const onNewLogin = vi.fn(async () => {});
+    activate({ onNewLogin });
+    const deviceId = await firstLogin();
+
+    await login('session-2', 3600, { ...HEADERS, 'user-agent': FIREFOX_LINUX_UA }, deviceId);
+
+    expect(onNewLogin).toHaveBeenCalledWith(expect.objectContaining({ reasons: ['new_device'] }));
+  });
+
+  it('replaces a malformed device cookie', async () => {
+    const onNewLogin = vi.fn(async () => {});
+    activate({ onNewLogin });
+    await firstLogin();
+
+    const extra = await login('session-2', 3600, HEADERS, '../../other-user:device');
+
+    expect(deviceCookieOf(extra).value).toMatch(/^[0-9a-f-]{36}$/);
+    expect(onNewLogin).toHaveBeenCalledWith(expect.objectContaining({ reasons: ['new_device'] }));
+  });
+
+  it('logs a failed callback without failing the sign-in', async () => {
+    activate({ onNewLogin: async () => { throw new Error('slack is down'); } });
+    await firstLogin();
+
+    await expect(login('session-2')).resolves.toBeDefined();
+
+    await vi.waitFor(() => {
+      expect(adminforthMock.afLogger.error).toHaveBeenCalledWith(expect.stringMatching(/onNewLogin failed.*slack is down/));
+    });
+  });
+
+  describe('revoke page', () => {
+    async function reportedLogin(sessionId: string) {
+      const onNewLogin = vi.fn(async (_params: any) => {});
+      const endpoints = endpointsOf(activate({ onNewLogin }));
+      await firstLogin();
+      const extra = await login(sessionId);
+      return {
+        endpoints,
+        token: tokenOf(onNewLogin.mock.calls[0][0].revokePath),
+        deviceId: deviceCookieOf(extra).value as string,
+      };
+    }
+
+    it('shows the reported session', async () => {
+      const { endpoints, token } = await reportedLogin('session-2');
+
+      const result = await endpoints['POST /plugin/user-sessions/session-by-token']({ body: { token }, response: responseStub() });
+
+      expect(result).toEqual({
+        session: {
+          ip: '8.8.8.8',
+          country: 'DE',
+          created_at: expect.any(String),
+          device: { browser: 'Chrome 131', os: 'macOS', type: 'desktop' },
+        },
+      });
+    });
+
+    it('tells that the reported session has already ended', async () => {
+      const { endpoints, token } = await reportedLogin('session-2');
+      await kv.delete(`${USER.pk}:session-2`, 'adminforth-user-sessions');
+
+      const result = await endpoints['POST /plugin/user-sessions/session-by-token']({ body: { token }, response: responseStub() });
+
+      expect(result).toEqual({ session: null });
+    });
+
+    it('rejects a token of another type', async () => {
+      const { endpoints } = await reportedLogin('session-2');
+      const response = responseStub();
+      const token = adminforth.auth.issueJWT({ pk: USER.pk, sessionId: 'session-2', deviceId: 'x' }, 'tempResetPassword');
+
+      const result = await endpoints['POST /plugin/user-sessions/revoke-by-token']({ body: { token }, response });
+
+      expect(result).toEqual({ error: 'Link is invalid or expired' });
+      expect(response.status).toEqual(400);
+      expect(await kv.get(`${USER.pk}:session-2`, 'adminforth-user-sessions')).not.toBeNull();
+    });
+
+    it('ends the reported session and forgets its device', async () => {
+      const { endpoints, token, deviceId } = await reportedLogin('session-2');
+
+      const result = await endpoints['POST /plugin/user-sessions/revoke-by-token']({ body: { token }, response: responseStub() });
+
+      expect(result).toEqual({ ok: true });
+      expect(await kv.get(`${USER.pk}:session-2`, 'adminforth-user-sessions')).toBeNull();
+      expect(await kv.get(`${USER.pk}:first-session`, 'adminforth-user-sessions')).not.toBeNull();
+      expect(knownDevice(deviceId)).toBeUndefined();
+    });
   });
 });
