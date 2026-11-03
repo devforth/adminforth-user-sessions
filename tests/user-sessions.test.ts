@@ -1100,6 +1100,14 @@ describe('login history', () => {
     expect(failedRecords().map((record) => record.attempts)).toEqual([1, 2]);
   });
 
+  it('does not write failed attempts until database discovery, which never happens while bundling', async () => {
+    activate({ loginHistory: LOGIN_HISTORY });
+    await failLogin('10.0.0.1');
+    await nextInterval();
+
+    expect(failedRecords()).toEqual([]);
+  });
+
   it('honors failedLogsInterval', async () => {
     activateWithHistory({ failedLogsInterval: '5m' });
     await failLogin('10.0.0.1');

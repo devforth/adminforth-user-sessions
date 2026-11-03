@@ -65,6 +65,7 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
   options: PluginOptions;
   pluginsScope: 'global' = 'global';
   private loginHistoryPkColumn?: string;
+  private failedLogins?: FailedLoginsBuffer;
 
   constructor(options: PluginOptions) {
     super(options, import.meta.url);
@@ -160,6 +161,14 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
       }
     }
     this.loginHistoryPkColumn = resource.columns.find((column) => column.primaryKey)!.name;
+
+    // started after discovery only: data API doesn't work before it, and bundling at build time never discovers
+    const intervalMs = convertPeriodToSeconds(loginHistory.failedLogsInterval ?? DEFAULT_FAILED_LOGS_INTERVAL) * 1000;
+    setInterval(() => {
+      this.storeFailedLogins(loginHistory, this.failedLogins!).catch((e) => {
+        afLogger.error(`UserSessionsPlugin: failed to store failed login attempts: ${e}`);
+      });
+    }, intervalMs).unref();
   }
 
   private async logSignIn(loginHistory: LoginHistoryOptions, pk: string | null, session: UserSessionRecord) {
@@ -179,8 +188,8 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
   }
 
   /**
-   * Counts failed password attempts in memory and writes them once per `failedLogsInterval`,
-   * so database load does not grow with the rate of a bruteforce.
+   * Counts failed password attempts in memory, `validateConfigAfterDiscover` starts writing them once per
+   * `failedLogsInterval`, so database load does not grow with the rate of a bruteforce.
    */
   private trackFailedLogins(loginHistory: LoginHistoryOptions) {
     const auth = this.adminforth.config.auth!;
@@ -191,6 +200,7 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
     }
 
     const failedLogins = new FailedLoginsBuffer(loginHistory.maxIpsPerLog ?? DEFAULT_MAX_IPS_PER_LOG);
+    this.failedLogins = failedLogins;
     (auth.afterLoginFailed as AfterLoginFailedFunction[]).push(
       async ({ pk, reason, extra }) => {
         // unknown usernames are not stored: anyone could create records for them at will,
@@ -203,13 +213,6 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
         await failedLogins.add(pk!, ip, () => this.resolveCountry(ip, extra.headers));
       }
     );
-
-    const intervalMs = convertPeriodToSeconds(loginHistory.failedLogsInterval ?? DEFAULT_FAILED_LOGS_INTERVAL) * 1000;
-    setInterval(() => {
-      this.storeFailedLogins(loginHistory, failedLogins).catch((e) => {
-        afLogger.error(`UserSessionsPlugin: failed to store failed login attempts: ${e}`);
-      });
-    }, intervalMs).unref();
   }
 
   /**
