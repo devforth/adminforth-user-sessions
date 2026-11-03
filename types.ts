@@ -232,11 +232,19 @@ export interface PluginOptions extends PluginsCommonOptions {
    * Called when a session turns out to be used in two browsers, which means its cookies were copied,
    * e.g. stolen by malware. The session is revoked before the call, so both browsers are signed out.
    *
-   * Every session gets a cookie with a nonce which is replaced every 10 minutes, a request with an outdated
-   * nonce tells that another browser holds a copy. Only sessions signed in while the option is set are checked.
+   * Every session gets a cookie with a nonce which is replaced every {@link PluginOptions.nonceRotationMinutes},
+   * a request with an outdated nonce tells that another browser holds a copy. Only sessions signed in while
+   * the option is set are checked.
    * The callback is not awaited, so a slow handler doesn't delay the response, its errors are logged.
    */
   onSessionCopied?: (params: SessionCopiedParams) => Promise<void>;
+
+  /**
+   * How often the nonce cookie of {@link PluginOptions.onSessionCopied} is replaced, in minutes. Default is 5.
+   * Every replacement is two writes to the adapter: the replacement itself and the first request with the new value,
+   * so lower values find a copy sooner at cost of more writes.
+   */
+  nonceRotationMinutes?: number;
 
   /**
    * Stores sign-ins and failed password attempts in a resource, see {@link LoginHistoryOptions}.

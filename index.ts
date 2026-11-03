@@ -31,6 +31,7 @@ import { parseUserAgent } from "./userAgent.js";
 const DEFAULT_COLLECTION = 'adminforth-user-sessions';
 const DEFAULT_COUNTRY_HEADER = 'CF-IPCountry';
 const DEFAULT_LAST_USED_THROTTLE_SECONDS = 60;
+const DEFAULT_NONCE_ROTATION_MINUTES = 5;
 // way longer than a request takes between reading the session and writing it back in touchSession
 const REVOKE_REPEAT_DELAY_MS = 5000;
 const ENDPOINTS_PREFIX = '/plugin/user-sessions';
@@ -458,7 +459,8 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
     // sessions signed in before onSessionCopied was set have no nonce and are not checked
     if (this.options.onSessionCopied && nonce) {
       const cookie = this.adminforth.auth.getCustomCookie({ cookies: extra.cookies, name: NONCE_COOKIE });
-      const check = checkNonce(nonce, cookie, new Date());
+      const rotationIntervalMs = (this.options.nonceRotationMinutes ?? DEFAULT_NONCE_ROTATION_MINUTES) * 60 * 1000;
+      const check = checkNonce(nonce, cookie, new Date(), rotationIntervalMs);
       if (!check) {
         await this.revokeCopiedSession(key, adminUser, record, extra);
         return { allowed: false, error: 'Session is used in two browsers' };

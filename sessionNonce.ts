@@ -1,7 +1,5 @@
 import type { SessionNonce } from "./types.js";
 
-// every rotation costs two writes to the adapter: the rotation itself and the first request with the new value
-const ROTATION_INTERVAL_MS = 10 * 60 * 1000;
 // a request sent before the browser got the new value may come after one sent with it, e.g. a slow upload
 const PREVIOUS_NONCE_GRACE_MS = 60 * 1000;
 
@@ -24,14 +22,14 @@ function rotate(nonce: SessionNonce, seenAt: string | null): SessionNonce {
  * Checks the nonce cookie of a request against the stored state of its session.
  * Returns null when the cookie can only come from a copy of the session made in another browser.
  */
-export function checkNonce(nonce: SessionNonce, cookie: string | null, now: Date): NonceCheck | null {
+export function checkNonce(nonce: SessionNonce, cookie: string | null, now: Date, rotationIntervalMs: number): NonceCheck | null {
   const seenAt = nonce.current_seen_at ? Date.parse(nonce.current_seen_at) : null;
 
   if (cookie === nonce.current) {
     if (seenAt === null) {
       return { nonce: { ...nonce, current_seen_at: now.toISOString() }, sendCookie: false };
     }
-    if (now.getTime() - seenAt >= ROTATION_INTERVAL_MS) {
+    if (now.getTime() - seenAt >= rotationIntervalMs) {
       return { nonce: rotate(nonce, null), sendCookie: true };
     }
     return { nonce, sendCookie: false };

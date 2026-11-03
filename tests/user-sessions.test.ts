@@ -977,7 +977,7 @@ describe('new login notifications', () => {
 describe('copied session detection', () => {
   const NONCE_COOKIE = 'adminforth_test_session_nonce';
   const SESSION_KEY = `adminforth-user-sessions:${USER.pk}:session-1`;
-  const TEN_MINUTES = 10 * 60 * 1000;
+  const FIVE_MINUTES = 5 * 60 * 1000;
 
   beforeEach(() => {
     vi.useFakeTimers();
@@ -1020,7 +1020,7 @@ describe('copied session detection', () => {
    */
   async function rotate(nonce: string) {
     await request(nonce);
-    vi.advanceTimersByTime(TEN_MINUTES);
+    vi.advanceTimersByTime(FIVE_MINUTES);
     return (await request(nonce)).sent.value as string;
   }
 
@@ -1051,11 +1051,11 @@ describe('copied session detection', () => {
     expect(sessions[0]).not.toHaveProperty('nonce');
   });
 
-  it('allows requests with the current nonce and replaces it every 10 minutes', async () => {
+  it('allows requests with the current nonce and replaces it every 5 minutes by default', async () => {
     const nonce = await signIn();
 
     expect(await request(nonce)).toEqual({ result: { allowed: true }, sent: undefined });
-    vi.advanceTimersByTime(TEN_MINUTES - 1000);
+    vi.advanceTimersByTime(FIVE_MINUTES - 1000);
     expect((await request(nonce)).sent).toBeUndefined();
     vi.advanceTimersByTime(1000);
     const { result, sent } = await request(nonce);
@@ -1070,10 +1070,22 @@ describe('copied session detection', () => {
     expect(sent.value).not.toEqual(nonce);
   });
 
+  it('replaces the nonce as often as nonceRotationMinutes tells', async () => {
+    activate({ onSessionCopied: vi.fn(async () => {}), nonceRotationMinutes: 1 });
+    const nonce = nonceCookieOf(await login('session-1')).value as string;
+
+    await request(nonce);
+    vi.advanceTimersByTime(60 * 1000 - 1000);
+    expect((await request(nonce)).sent).toBeUndefined();
+    vi.advanceTimersByTime(1000);
+
+    expect((await request(nonce)).sent.value).not.toEqual(nonce);
+  });
+
   it('accepts the previous nonce until the browser comes with the new one, giving the new one again', async () => {
     const nonce = await signIn();
     const newNonce = await rotate(nonce);
-    vi.advanceTimersByTime(TEN_MINUTES);
+    vi.advanceTimersByTime(FIVE_MINUTES);
 
     const { result, sent } = await request(nonce);
 
@@ -1129,7 +1141,7 @@ describe('copied session detection', () => {
   it('gives parallel requests which replace the nonce at once the same new one', async () => {
     const nonce = await signIn();
     await request(nonce);
-    vi.advanceTimersByTime(TEN_MINUTES);
+    vi.advanceTimersByTime(FIVE_MINUTES);
 
     const [first, second] = await Promise.all([request(nonce), request(nonce)]);
 
@@ -1140,7 +1152,7 @@ describe('copied session detection', () => {
   it('accepts the new nonce after a parallel request wrote the session back as it was before the rotation', async () => {
     const nonce = await signIn();
     await request(nonce);
-    vi.advanceTimersByTime(TEN_MINUTES);
+    vi.advanceTimersByTime(FIVE_MINUTES);
     const beforeRotation = kv.entries.get(SESSION_KEY)!;
     const newNonce = (await request(nonce)).sent.value;
     kv.entries.set(SESSION_KEY, beforeRotation);
