@@ -720,6 +720,32 @@ describe('sessions of other users', () => {
   });
 });
 
+describe('revoking all sessions', () => {
+  it('revokes sessions of every user, keeping their known devices', async () => {
+    const plugin = activate({ onNewLogin: async () => {} });
+    await login('session-1');
+    await hooks().sessionCreated({
+      pk: 'user-2', username: 'root', sessionId: 'session-2', expiresInSeconds: 3600, adminforth, extra: extraOf(),
+    });
+
+    expect(await plugin.revokeAllSessions()).toEqual(2);
+    expect(await hooks().authorize({ adminUser: { ...USER, sessionId: 'session-1' } }))
+      .toEqual({ allowed: false, error: 'Session was revoked' });
+    expect(await kv.listByPrefix('', 10, 'adminforth-user-sessions')).toEqual([]);
+    expect(await kv.listByPrefix('', 10, 'adminforth-user-sessions-devices')).toHaveLength(2);
+  });
+
+  it('revokes more sessions than fit into one batch', async () => {
+    const plugin = activate();
+    for (let i = 0; i < 501; i++) {
+      await login(`session-${i}`);
+    }
+
+    expect(await plugin.revokeAllSessions()).toEqual(501);
+    expect(await kv.listByPrefix('', 1, 'adminforth-user-sessions')).toEqual([]);
+  });
+});
+
 describe('new login notifications', () => {
   const FIREFOX_LINUX_UA = 'Mozilla/5.0 (X11; Linux x86_64; rv:133.0) Gecko/20100101 Firefox/133.0';
   const DEVICES_COLLECTION = 'adminforth-user-sessions-devices';

@@ -33,6 +33,8 @@ const REVOKE_REPEAT_DELAY_MS = 5000;
 const ENDPOINTS_PREFIX = '/plugin/user-sessions';
 // listing is done for one user only, so the limit is just a sanity cap
 const PER_USER_LIST_LIMIT = 500;
+// sessions of all users are revoked in batches, so the whole store is never loaded at once
+const REVOKE_ALL_BATCH_SIZE = 500;
 // real user agents are well under this; the header itself is client-controlled and can be ~16KB
 const USER_AGENT_MAX_LENGTH = 512;
 const COUNTRY_CODE_RE = /^[A-Z]{2}$/;
@@ -116,7 +118,7 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
         }
         // older AdminForth releases abort logout and keep the auth cookie when a beforeLogout hook throws
         try {
-          await this.revokeSession(adminUser.pk, adminUser.sessionId);
+          await this.revokeSession(userKey(adminUser.pk, adminUser.sessionId));
         } catch (e) {
           afLogger.error(`UserSessionsPlugin: failed to revoke session on logout: ${e}`);
         }
@@ -378,11 +380,26 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
   }
 
   /**
+   * Revokes every stored session of every user, the caller's own one included, so everybody is signed
+   * out on their next request. Known devices are kept. Returns the number of revoked sessions.
+   */
+  async revokeAllSessions(): Promise<number> {
+    let revoked = 0;
+    let keys: string[];
+    do {
+      const rows = await this.kv.listByPrefix('', REVOKE_ALL_BATCH_SIZE, this.collection);
+      keys = rows.map((row) => Object.keys(row)[0]);
+      await Promise.all(keys.map((key) => this.revokeSession(key)));
+      revoked += keys.length;
+    } while (keys.length === REVOKE_ALL_BATCH_SIZE);
+    return revoked;
+  }
+
+  /**
    * Deletes the session, then deletes it once more a bit later: a request which read the session
    * right before the first delete may still write it back while refreshing `last_used_at`.
    */
-  private async revokeSession(pk: string | null, sessionId: string) {
-    const key = userKey(pk, sessionId);
+  private async revokeSession(key: string) {
     await this.kv.delete(key, this.collection);
     setTimeout(() => {
       this.kv.delete(key, this.collection).catch((e) => {
@@ -500,7 +517,7 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
           response.setStatus(403);
           return { error: 'Not allowed to manage sessions of this user' };
         }
-        await this.revokeSession(userPk, body.sessionId);
+        await this.revokeSession(userKey(userPk, body.sessionId));
         return { ok: true };
       },
     });
@@ -518,7 +535,7 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
         // session the request is made with survives, for another user it means all of their sessions go
         const sessions = await this.listSessions(userPk, adminUser.sessionId);
         const revoked = sessions.filter((session) => !session.isCurrent);
-        await Promise.all(revoked.map((session) => this.revokeSession(userPk, session.sessionId)));
+        await Promise.all(revoked.map((session) => this.revokeSession(userKey(userPk, session.sessionId))));
         return { ok: true, revoked: revoked.length };
       },
     });
@@ -558,7 +575,7 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
           return { error: INVALID_LINK_ERROR };
         }
         await Promise.all([
-          this.revokeSession(token.pk, token.sessionId),
+          this.revokeSession(userKey(token.pk, token.sessionId)),
           // the device is not trusted anymore, so the next sign-in from it is reported again
           this.kv.delete(userKey(token.pk, token.deviceId), this.devicesCollection),
         ]);
