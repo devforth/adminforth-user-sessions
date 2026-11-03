@@ -1002,11 +1002,12 @@ describe('copied session detection', () => {
   /**
    * Request of `session-1` with a token valid for one more hour. Gives the nonce cookie set in the response, if any.
    */
-  async function request(nonce?: string, headers: Record<string, string> = HEADERS) {
+  async function request(nonce?: string, headers: Record<string, string> = HEADERS, websocket?: 'handshake' | 'reauthorize') {
     const extra = {
       headers,
       cookies: nonce ? [{ key: NONCE_COOKIE, value: nonce }] : [],
       response: { cookies: [] as any[] },
+      websocket,
     };
     const result = await hooks().authorize({
       adminUser: { ...USER, sessionId: 'session-1', exp: Math.floor(Date.now() / 1000) + 3600 },
@@ -1129,6 +1130,18 @@ describe('copied session detection', () => {
         request: { ip: '1.2.3.4', country: 'NL', device: parseUserAgent(FIREFOX_LINUX_UA) },
       });
     });
+  });
+
+  it('checks the nonce of a websocket on its handshake only, later checks come with the cookies of the handshake', async () => {
+    const onSessionCopied = vi.fn(async () => {});
+    const nonce = await signIn(onSessionCopied);
+    const newNonce = await rotate(nonce);
+    await request(newNonce);
+    vi.advanceTimersByTime(60 * 1000);
+
+    expect(await request(nonce, HEADERS, 'reauthorize')).toEqual({ result: { allowed: true }, sent: undefined });
+    expect(onSessionCopied).not.toHaveBeenCalled();
+    expect((await request(nonce, HEADERS, 'handshake')).result).toEqual({ allowed: false, error: 'Session is used in two browsers' });
   });
 
   it('revokes a session requested without the nonce cookie', async () => {

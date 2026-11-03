@@ -456,8 +456,9 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
 
     const record = JSON.parse(stored) as UserSessionRecord;
     let nonce = record.nonce;
-    // sessions signed in before onSessionCopied was set have no nonce and are not checked
-    if (this.options.onSessionCopied && nonce) {
+    // sessions signed in before onSessionCopied was set have no nonce and are not checked,
+    // a websocket is checked again with the cookies of its handshake, its nonce is outdated after a rotation
+    if (this.options.onSessionCopied && nonce && extra.websocket !== 'reauthorize') {
       const cookie = this.adminforth.auth.getCustomCookie({ cookies: extra.cookies, name: NONCE_COOKIE });
       const rotationIntervalMs = (this.options.nonceRotationMinutes ?? DEFAULT_NONCE_ROTATION_MINUTES) * 60 * 1000;
       const check = checkNonce(nonce, cookie, new Date(), rotationIntervalMs);
