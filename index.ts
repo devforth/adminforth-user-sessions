@@ -477,7 +477,13 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
         if (!await this.canManage(adminUser, userPk)) {
           return { allowed: false, sessions: [] };
         }
-        return { allowed: true, sessions: await this.listSessions(userPk, adminUser.sessionId) };
+        const ipsVisible = this.options.canSeeIps ? await this.options.canSeeIps(adminUser) : true;
+        const sessions = await this.listSessions(userPk, adminUser.sessionId);
+        return {
+          allowed: true,
+          ipsVisible,
+          sessions: ipsVisible ? sessions : sessions.map((session) => ({ ...session, ip: null })),
+        };
       },
     });
 

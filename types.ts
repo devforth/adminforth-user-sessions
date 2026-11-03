@@ -165,6 +165,15 @@ export interface PluginOptions extends PluginsCommonOptions {
   canManageOtherUsersSessions?: (adminUser: AdminUser) => Promise<boolean>;
 
   /**
+   * Decides whether `adminUser` sees IP addresses of sessions, own ones included, e.g. to hide them on a
+   * public demo where everybody signs in as the same user. Return `true` to show them.
+   *
+   * When the option is not set, IPs are shown to everybody who sees the sessions.
+   * Hidden IPs are not sent to the browser at all, the page shows them masked.
+   */
+  canSeeIps?: (adminUser: AdminUser) => Promise<boolean>;
+
+  /**
    * How often `last_used_at` of a session is refreshed, in seconds. Default is 60.
    * Every refresh is one write to the adapter, so lower values give more precise
    * "last used" at cost of more writes.

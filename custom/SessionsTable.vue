@@ -44,7 +44,14 @@
       </template>
 
       <template #cell:ip="{ item }">
-        <span :class="{ 'text-lightInputPlaceholderText dark:text-darkInputPlaceholderText': !item.ip }">
+        <Tooltip v-if="!ipsVisible">
+          <span class="af-user-sessions-ip-hidden flex items-center gap-1.5 text-lightInputPlaceholderText dark:text-darkInputPlaceholderText">
+            <IconEyeOff class="w-4 h-4 shrink-0" />
+            •••.•••.•••.•••
+          </span>
+          <template #tooltip>{{ $t('You are not allowed to see IP addresses') }}</template>
+        </Tooltip>
+        <span v-else :class="{ 'text-lightInputPlaceholderText dark:text-darkInputPlaceholderText': !item.ip }">
           {{ item.ip || $t('Unknown') }}
         </span>
       </template>
@@ -82,8 +89,8 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue';
 import { useI18n } from 'vue-i18n';
-import { IconCircleQuestionMark, IconMonitor, IconSmartphone, IconTablet } from '@iconify-prerendered/vue-lucide';
-import { Button, CountryFlag, PageHeader, Table } from '@/afcl';
+import { IconCircleQuestionMark, IconEyeOff, IconMonitor, IconSmartphone, IconTablet } from '@iconify-prerendered/vue-lucide';
+import { Button, CountryFlag, PageHeader, Table, Tooltip } from '@/afcl';
 import adminforth from '@/adminforth';
 import { callAdminForthApi, formatDateTime } from '@/utils';
 
@@ -123,6 +130,8 @@ const sessions = ref<UserSession[]>([]);
 const loading = ref(true);
 // sessions of another user are shown only after the backend confirmed it is allowed
 const allowed = ref(!props.userPk);
+// the backend leaves IPs out of the response when they are hidden from the user
+const ipsVisible = ref(true);
 const revokingId = ref<string | null>(null);
 const revokingAll = ref(false);
 
@@ -159,6 +168,7 @@ async function loadSessions() {
     });
     if (response) {
       allowed.value = response.allowed;
+      ipsVisible.value = response.ipsVisible;
       sessions.value = response.sessions;
     }
   } finally {

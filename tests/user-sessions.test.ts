@@ -590,6 +590,41 @@ describe('endpoints', () => {
   });
 });
 
+describe('IP addresses', () => {
+  it('are listed when no callback is configured', async () => {
+    const endpoints = endpointsOf(activate());
+    await login('session-1');
+
+    const result = await endpoints['POST /plugin/user-sessions/list']({ adminUser: USER, body: {} });
+
+    expect(result.ipsVisible).toBe(true);
+    expect(result.sessions[0].ip).toBe('8.8.8.8');
+  });
+
+  it('are listed to a user the callback allows', async () => {
+    const canSeeIps = vi.fn(async () => true);
+    const endpoints = endpointsOf(activate({ canSeeIps }));
+    await login('session-1');
+
+    const result = await endpoints['POST /plugin/user-sessions/list']({ adminUser: USER, body: {} });
+
+    expect(canSeeIps).toHaveBeenCalledWith(USER);
+    expect(result.ipsVisible).toBe(true);
+    expect(result.sessions[0].ip).toBe('8.8.8.8');
+  });
+
+  it('are left out of the response for a user the callback rejects, even for own sessions', async () => {
+    const endpoints = endpointsOf(activate({ canSeeIps: async () => false }));
+    await login('session-1');
+
+    const result = await endpoints['POST /plugin/user-sessions/list']({ adminUser: USER, body: {} });
+
+    expect(result.ipsVisible).toBe(false);
+    expect(result.sessions).toEqual([expect.objectContaining({ sessionId: 'session-1', ip: null, country: 'DE' })]);
+    expect(JSON.stringify(result)).not.toContain('8.8.8.8');
+  });
+});
+
 describe('sessions of other users', () => {
   const SUPERADMIN = { pk: 'user-2', username: 'root', dbUser: { role: 'superadmin' }, sessionId: 'own-session' };
 
