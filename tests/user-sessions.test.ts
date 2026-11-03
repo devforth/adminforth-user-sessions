@@ -99,6 +99,7 @@ const LOGIN_HISTORY = {
 
 const USER = { pk: 'user-1', username: 'adminforth', dbUser: {} };
 const CHROME_MAC_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+const FIREFOX_LINUX_UA = 'Mozilla/5.0 (X11; Linux x86_64; rv:133.0) Gecko/20100101 Firefox/133.0';
 const HEADERS = { 'x-forwarded-for': '8.8.8.8', 'cf-ipcountry': 'DE', 'user-agent': CHROME_MAC_UA };
 const DEVICE_COOKIE = 'adminforth_test_device';
 
@@ -747,7 +748,6 @@ describe('revoking all sessions', () => {
 });
 
 describe('new login notifications', () => {
-  const FIREFOX_LINUX_UA = 'Mozilla/5.0 (X11; Linux x86_64; rv:133.0) Gecko/20100101 Firefox/133.0';
   const DEVICES_COLLECTION = 'adminforth-user-sessions-devices';
 
   function deviceCookieOf(extra: any) {
@@ -970,6 +970,213 @@ describe('new login notifications', () => {
       expect(await kv.get(`${USER.pk}:session-2`, 'adminforth-user-sessions')).toBeNull();
       expect(await kv.get(`${USER.pk}:first-session`, 'adminforth-user-sessions')).not.toBeNull();
       expect(knownDevice(deviceId)).toBeUndefined();
+    });
+  });
+});
+
+describe('copied session detection', () => {
+  const NONCE_COOKIE = 'adminforth_test_session_nonce';
+  const SESSION_KEY = `adminforth-user-sessions:${USER.pk}:session-1`;
+  const FIVE_MINUTES = 5 * 60 * 1000;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function nonceCookieOf(extra: any) {
+    return extra.response.cookies.find((cookie: any) => cookie.name === 'session_nonce');
+  }
+
+  /**
+   * Signs in as `session-1` and gives the nonce the browser got.
+   */
+  async function signIn(onSessionCopied: (params: any) => Promise<void> = vi.fn(async () => {})) {
+    activate({ onSessionCopied });
+    return nonceCookieOf(await login('session-1')).value as string;
+  }
+
+  /**
+   * Request of `session-1` with a token valid for one more hour. Gives the nonce cookie set in the response, if any.
+   */
+  async function request(nonce?: string, headers: Record<string, string> = HEADERS) {
+    const extra = {
+      headers,
+      cookies: nonce ? [{ key: NONCE_COOKIE, value: nonce }] : [],
+      response: { cookies: [] as any[] },
+    };
+    const result = await hooks().authorize({
+      adminUser: { ...USER, sessionId: 'session-1', exp: Math.floor(Date.now() / 1000) + 3600 },
+      extra,
+    });
+    return { result, sent: nonceCookieOf(extra) };
+  }
+
+  /**
+   * Uses the nonce, waits until it is due to be replaced and gives the new one, which the browser has not used yet.
+   */
+  async function rotate(nonce: string) {
+    await request(nonce);
+    vi.advanceTimersByTime(FIVE_MINUTES);
+    return (await request(nonce)).sent.value as string;
+  }
+
+  it('gives the browser a nonce on sign-in only when the callback is set', async () => {
+    activate();
+    expect(nonceCookieOf(await login('session-1'))).toBeUndefined();
+    expect(storedSession('session-1').nonce).toBeUndefined();
+
+    adminforth = createAdminforth();
+    activate({ onSessionCopied: vi.fn(async () => {}) });
+    const cookie = nonceCookieOf(await login('session-2', 900));
+
+    expect(cookie).toEqual({
+      name: 'session_nonce',
+      value: expect.stringMatching(/^[0-9a-f-]{36}$/),
+      expirySeconds: 900,
+      httpOnly: true,
+    });
+    expect(storedSession('session-2').nonce.current).toEqual(cookie.value);
+  });
+
+  it('keeps the nonce out of the sessions list', async () => {
+    const endpoints = endpointsOf(activate({ onSessionCopied: vi.fn(async () => {}) }));
+    await login('session-1');
+
+    const { sessions } = await endpoints['POST /plugin/user-sessions/list']({ adminUser: USER, body: {} });
+
+    expect(sessions[0]).not.toHaveProperty('nonce');
+  });
+
+  it('allows requests with the current nonce and replaces it every 5 minutes by default', async () => {
+    const nonce = await signIn();
+
+    expect(await request(nonce)).toEqual({ result: { allowed: true }, sent: undefined });
+    vi.advanceTimersByTime(FIVE_MINUTES - 1000);
+    expect((await request(nonce)).sent).toBeUndefined();
+    vi.advanceTimersByTime(1000);
+    const { result, sent } = await request(nonce);
+
+    expect(result).toEqual({ allowed: true });
+    expect(sent).toEqual({
+      name: 'session_nonce',
+      value: expect.stringMatching(/^[0-9a-f-]{36}$/),
+      expirySeconds: 3600,
+      httpOnly: true,
+    });
+    expect(sent.value).not.toEqual(nonce);
+  });
+
+  it('replaces the nonce as often as nonceRotationMinutes tells', async () => {
+    activate({ onSessionCopied: vi.fn(async () => {}), nonceRotationMinutes: 1 });
+    const nonce = nonceCookieOf(await login('session-1')).value as string;
+
+    await request(nonce);
+    vi.advanceTimersByTime(60 * 1000 - 1000);
+    expect((await request(nonce)).sent).toBeUndefined();
+    vi.advanceTimersByTime(1000);
+
+    expect((await request(nonce)).sent.value).not.toEqual(nonce);
+  });
+
+  it('accepts the previous nonce until the browser comes with the new one, giving the new one again', async () => {
+    const nonce = await signIn();
+    const newNonce = await rotate(nonce);
+    vi.advanceTimersByTime(FIVE_MINUTES);
+
+    const { result, sent } = await request(nonce);
+
+    expect(result).toEqual({ allowed: true });
+    expect(sent.value).toEqual(newNonce);
+  });
+
+  it('accepts the previous nonce shortly after the new one came, from requests sent before it', async () => {
+    const nonce = await signIn();
+    const newNonce = await rotate(nonce);
+    await request(newNonce);
+    vi.advanceTimersByTime(30 * 1000);
+
+    expect(await request(nonce)).toEqual({ result: { allowed: true }, sent: undefined });
+  });
+
+  it('revokes and reports the session when the previous nonce comes after the new one was used', async () => {
+    const onSessionCopied = vi.fn(async (_params: any) => {});
+    const nonce = await signIn(onSessionCopied);
+    const newNonce = await rotate(nonce);
+    await request(newNonce);
+    vi.advanceTimersByTime(60 * 1000);
+
+    const { result } = await request(nonce, { 'x-forwarded-for': '1.2.3.4', 'cf-ipcountry': 'NL', 'user-agent': FIREFOX_LINUX_UA });
+
+    expect(result).toEqual({ allowed: false, error: 'Session is used in two browsers' });
+    expect((await request(newNonce)).result).toEqual({ allowed: false, error: 'Session was revoked' });
+    await vi.waitFor(() => {
+      expect(onSessionCopied).toHaveBeenCalledWith({
+        pk: USER.pk,
+        username: USER.username,
+        session: {
+          sessionId: 'session-1',
+          ip: '8.8.8.8',
+          country: 'DE',
+          user_agent: CHROME_MAC_UA,
+          created_at: expect.any(String),
+          last_used_at: expect.any(String),
+          device: { browser: 'Chrome 131', os: 'macOS', type: 'desktop' },
+        },
+        request: { ip: '1.2.3.4', country: 'NL', device: parseUserAgent(FIREFOX_LINUX_UA) },
+      });
+    });
+  });
+
+  it('revokes a session requested without the nonce cookie', async () => {
+    await signIn();
+
+    expect((await request()).result).toEqual({ allowed: false, error: 'Session is used in two browsers' });
+    expect(kv.entries.has(SESSION_KEY)).toBe(false);
+  });
+
+  it('gives parallel requests which replace the nonce at once the same new one', async () => {
+    const nonce = await signIn();
+    await request(nonce);
+    vi.advanceTimersByTime(FIVE_MINUTES);
+
+    const [first, second] = await Promise.all([request(nonce), request(nonce)]);
+
+    expect(first.sent.value).toEqual(second.sent.value);
+    expect(storedSession('session-1').nonce.current).toEqual(first.sent.value);
+  });
+
+  it('accepts the new nonce after a parallel request wrote the session back as it was before the rotation', async () => {
+    const nonce = await signIn();
+    await request(nonce);
+    vi.advanceTimersByTime(FIVE_MINUTES);
+    const beforeRotation = kv.entries.get(SESSION_KEY)!;
+    const newNonce = (await request(nonce)).sent.value;
+    kv.entries.set(SESSION_KEY, beforeRotation);
+
+    expect(await request(newNonce)).toEqual({ result: { allowed: true }, sent: undefined });
+    expect(storedSession('session-1').nonce).toEqual(expect.objectContaining({ current: newNonce, previous: nonce }));
+  });
+
+  it('does not check sessions signed in before the callback was set', async () => {
+    activate();
+    await login('session-1');
+    adminforth = createAdminforth();
+    activate({ onSessionCopied: vi.fn(async () => {}) });
+
+    expect((await request()).result).toEqual({ allowed: true });
+  });
+
+  it('logs a failed callback', async () => {
+    await signIn(async () => { throw new Error('slack is down'); });
+
+    await request();
+
+    await vi.waitFor(() => {
+      expect(adminforthMock.afLogger.error).toHaveBeenCalledWith(expect.stringMatching(/onSessionCopied failed.*slack is down/));
     });
   });
 });
