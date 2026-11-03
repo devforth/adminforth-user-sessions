@@ -8,11 +8,13 @@ import type {
   BeforeLogoutFunction,
   HttpExtra,
   IAdminForth,
+  IAdminForthHttpResponse,
   IHttpServer,
   KeyValueAdapter,
 } from "adminforth";
 import { z } from "zod";
 import { FailedLoginsBuffer } from "./failedLoginsBuffer.js";
+import { checkNonce, createNonce } from "./sessionNonce.js";
 import type {
   KnownDeviceRecord,
   LoginHistoryOptions,
@@ -20,6 +22,7 @@ import type {
   PluginOptions,
   RevokeTokenPayload,
   SessionDevice,
+  SessionNonce,
   UserSessionListItem,
   UserSessionRecord,
 } from "./types.js";
@@ -39,6 +42,7 @@ const REVOKE_ALL_BATCH_SIZE = 500;
 const USER_AGENT_MAX_LENGTH = 512;
 const COUNTRY_CODE_RE = /^[A-Z]{2}$/;
 const DEVICE_COOKIE = 'device';
+const NONCE_COOKIE = 'session_nonce';
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const KNOWN_DEVICE_TTL_SECONDS = 2 * 365 * 24 * 60 * 60;
 const REVOKE_TOKEN_TYPE = 'userSessionRevoke';
@@ -108,7 +112,7 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
     // unshifted: a revoked session must be rejected before any other hook lets it do work
     (auth.adminUserAuthorize as AdminUserAuthorizeFunction[]).unshift(
       // params are declared optional by AdminForth type, but are always passed
-      async (params) => this.authorizeSession(params!.adminUser)
+      async (params) => this.authorizeSession(params!.adminUser, params!.extra!)
     );
 
     (auth.beforeLogout as BeforeLogoutFunction[]).push(
@@ -306,8 +310,21 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
       created_at: now,
       last_used_at: now,
     };
-    await this.kv.set(userKey(pk, sessionId), JSON.stringify(record), expiresInSeconds, this.collection);
+    // the browser gets the nonce along with the auth cookie, a session signed in without a response is not checked
+    let nonce: SessionNonce | undefined;
+    if (this.options.onSessionCopied && extra) {
+      nonce = createNonce();
+      this.setNonceCookie(extra.response, nonce.current, expiresInSeconds);
+    }
+    await this.kv.set(userKey(pk, sessionId), JSON.stringify({ ...record, nonce }), expiresInSeconds, this.collection);
     return record;
+  }
+
+  private setNonceCookie(response: IAdminForthHttpResponse, value: string, expirySeconds?: number) {
+    this.adminforth.auth.setCustomCookie({
+      response,
+      payload: { name: NONCE_COOKIE, value, expirySeconds, httpOnly: true },
+    });
   }
 
   /**
@@ -423,7 +440,7 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
     return null;
   }
 
-  private async authorizeSession(adminUser: AdminUser): Promise<{ allowed: boolean, error?: string }> {
+  private async authorizeSession(adminUser: AdminUser, extra: HttpExtra): Promise<{ allowed: boolean, error?: string }> {
     if (!adminUser.sessionId) {
       // no session to check: request is done by an api key (e.g. MCP plugin) or by a token
       // issued before this plugin was installed
@@ -436,21 +453,60 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
       return { allowed: false, error: 'Session was revoked' };
     }
 
-    await this.touchSession(key, JSON.parse(stored) as UserSessionRecord, adminUser.exp);
+    const record = JSON.parse(stored) as UserSessionRecord;
+    let nonce = record.nonce;
+    // sessions signed in before onSessionCopied was set have no nonce and are not checked
+    if (this.options.onSessionCopied && nonce) {
+      const cookie = this.adminforth.auth.getCustomCookie({ cookies: extra.cookies, name: NONCE_COOKIE });
+      const check = checkNonce(nonce, cookie, new Date());
+      if (!check) {
+        await this.revokeCopiedSession(key, adminUser, record, extra);
+        return { allowed: false, error: 'Session is used in two browsers' };
+      }
+      // a websocket handshake can't set it, the browser gets it on the next request with the previous value
+      if (check.sendCookie) {
+        this.setNonceCookie(extra.response, check.nonce.current, secondsLeft(adminUser.exp));
+      }
+      nonce = check.nonce;
+    }
+
+    await this.touchSession(key, { ...record, nonce }, adminUser.exp, nonce !== record.nonce);
     return { allowed: true };
   }
 
   /**
-   * Refreshes `last_used_at`, not more often than once per `lastUsedThrottleSeconds`.
-   * Record is rewritten, so remaining lifetime of the token is re-applied as expiration.
+   * Revokes a session found in two browsers and reports it. The request may come from either of them,
+   * so both are signed out.
    */
-  private async touchSession(key: string, record: UserSessionRecord, tokenExpiresAt?: number) {
+  private async revokeCopiedSession(key: string, adminUser: AdminUser, record: UserSessionRecord, extra: HttpExtra) {
+    await this.revokeSession(key);
+
+    const { nonce, ...session } = record;
+    const ip = this.adminforth.auth.getClientIp(extra.headers);
+    // not awaited: a slow handler (e.g. a request to Slack) must not delay the response
+    this.resolveCountry(ip, extra.headers)
+      .then((country) => this.options.onSessionCopied!({
+        pk: adminUser.pk,
+        username: adminUser.username,
+        session: { ...session, sessionId: adminUser.sessionId!, device: parseUserAgent(session.user_agent) },
+        request: { ip, country, device: parseUserAgent(extra.headers['user-agent']) },
+      }))
+      .catch((e) => {
+        afLogger.error(`UserSessionsPlugin: onSessionCopied failed: ${e}`);
+      });
+  }
+
+  /**
+   * Writes the session back when its nonce changed, and to refresh `last_used_at` not more often than once per
+   * `lastUsedThrottleSeconds`. Record is rewritten, so remaining lifetime of the token is re-applied as expiration.
+   */
+  private async touchSession(key: string, record: UserSessionRecord, tokenExpiresAt: number | undefined, nonceChanged: boolean) {
     const throttleMs = (this.options.lastUsedThrottleSeconds ?? DEFAULT_LAST_USED_THROTTLE_SECONDS) * 1000;
-    if (Date.now() - new Date(record.last_used_at).getTime() < throttleMs) {
+    if (!nonceChanged && Date.now() - new Date(record.last_used_at).getTime() < throttleMs) {
       return;
     }
 
-    const expiresInSeconds = tokenExpiresAt ? tokenExpiresAt - Math.floor(Date.now() / 1000) : undefined;
+    const expiresInSeconds = secondsLeft(tokenExpiresAt);
     if (expiresInSeconds !== undefined && expiresInSeconds <= 0) {
       return;
     }
@@ -478,7 +534,7 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
     const records = await this.listOfUser<UserSessionRecord>(userPk, this.collection);
 
     return records
-      .map(([sessionId, record]) => ({
+      .map(([sessionId, { nonce, ...record }]) => ({
         ...record,
         sessionId,
         isCurrent: sessionId === currentSessionId,
@@ -587,6 +643,13 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
 
 function userKey(pk: string | null, id: string): string {
   return `${pk}:${id}`;
+}
+
+/**
+ * Remaining lifetime of the auth token, undefined when its expiration is unknown.
+ */
+function secondsLeft(tokenExpiresAt?: number): number | undefined {
+  return tokenExpiresAt ? tokenExpiresAt - Math.floor(Date.now() / 1000) : undefined;
 }
 
 function isSameDevice(a: SessionDevice | null, b: SessionDevice | null): boolean {

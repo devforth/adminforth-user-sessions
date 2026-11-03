@@ -10,6 +10,29 @@ export interface UserSessionRecord {
   user_agent: string | null;
   created_at: string;
   last_used_at: string;
+  /**
+   * Present for sessions signed in while {@link PluginOptions.onSessionCopied} is set.
+   * It is a secret of the browser, so it is never sent to the frontend or passed to callbacks.
+   */
+  nonce?: SessionNonce;
+}
+
+/**
+ * State of the nonce cookie of a session. Its value is replaced from time to time, so a copy of the session
+ * in another browser falls behind and gives itself away with an outdated value.
+ */
+export interface SessionNonce {
+  /** Value the browser should send. */
+  current: string;
+  /** When a request with `current` came first, null until then: the browser may not have got it yet. */
+  current_seen_at: string | null;
+  /** Value replaced by `current`, still accepted from requests sent before the browser got `current`. */
+  previous: string | null;
+  /**
+   * Value which becomes `current` on the next rotation. It is chosen in advance, so parallel requests
+   * which rotate at once give the browser the same value.
+   */
+  next: string;
 }
 
 /**
@@ -24,7 +47,7 @@ export interface SessionDevice {
 /**
  * One session as it is returned to the settings page.
  */
-export interface UserSessionListItem extends UserSessionRecord {
+export interface UserSessionListItem extends Omit<UserSessionRecord, 'nonce'> {
   sessionId: string;
   isCurrent: boolean;
   /** Null when the session was stored without a user agent. */
@@ -57,6 +80,22 @@ export interface NewLoginParams {
    * the origin of the sign-in request is controlled by whoever signed in, so the plugin doesn't use it.
    */
   revokePath: string;
+}
+
+export interface SessionCopiedParams {
+  pk: string | null;
+  username: string;
+  /** The session as it was signed in. It is revoked already, so both browsers are signed out of it. */
+  session: Omit<UserSessionListItem, 'isCurrent'>;
+  /**
+   * Request which came with an outdated nonce cookie. It is sent either by the user or by whoever copied
+   * the session, there is no way to tell which one.
+   */
+  request: {
+    ip: string | null;
+    country: string | null;
+    device: SessionDevice | null;
+  };
 }
 
 /**
@@ -188,6 +227,16 @@ export interface PluginOptions extends PluginsCommonOptions {
    * The callback is not awaited, so a slow handler doesn't delay the sign-in, its errors are logged.
    */
   onNewLogin?: (params: NewLoginParams) => Promise<void>;
+
+  /**
+   * Called when a session turns out to be used in two browsers, which means its cookies were copied,
+   * e.g. stolen by malware. The session is revoked before the call, so both browsers are signed out.
+   *
+   * Every session gets a cookie with a nonce which is replaced every 10 minutes, a request with an outdated
+   * nonce tells that another browser holds a copy. Only sessions signed in while the option is set are checked.
+   * The callback is not awaited, so a slow handler doesn't delay the response, its errors are logged.
+   */
+  onSessionCopied?: (params: SessionCopiedParams) => Promise<void>;
 
   /**
    * Stores sign-ins and failed password attempts in a resource, see {@link LoginHistoryOptions}.
