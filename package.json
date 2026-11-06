@@ -38,14 +38,14 @@
   },
   "devDependencies": {
     "@types/node": "latest",
-    "adminforth": "^4.23.0",
+    "adminforth": "^4.24.0",
     "semantic-release": "^24.2.1",
     "semantic-release-slack-bot": "^4.0.2",
     "typescript": "^5.7.3",
     "vitest": "^3.2.4"
   },
   "peerDependencies": {
-    "adminforth": "^4.23.0"
+    "adminforth": "^4.24.0"
   },
   "release": {
     "plugins": [
