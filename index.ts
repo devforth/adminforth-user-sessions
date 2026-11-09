@@ -96,12 +96,13 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
 
     (auth.afterSessionCreated as AfterSessionCreatedFunction[]).push(
       async ({ pk, username, sessionId, expiresInSeconds, extra }) => {
-        const session = await this.storeSession(pk, sessionId, expiresInSeconds, extra);
+        const deviceId = this.options.onNewLogin && extra ? this.setDeviceCookie(extra) : undefined;
+        const session = await this.storeSession(pk, sessionId, expiresInSeconds, extra, deviceId);
         if (this.options.loginHistory) {
           await this.logSignIn(this.options.loginHistory, pk, session);
         }
-        if (this.options.onNewLogin && extra) {
-          await this.trackDevice({ pk, username, sessionId, expiresInSeconds, extra, session });
+        if (deviceId) {
+          await this.trackDevice({ pk, username, sessionId, expiresInSeconds, deviceId, session });
         }
       }
     );
@@ -298,8 +299,12 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
     return `${this.collection}-devices`;
   }
 
+  private get usedLinksCollection(): string {
+    return `${this.collection}-used-links`;
+  }
+
   private async storeSession(
-    pk: string | null, sessionId: string, expiresInSeconds: number, extra?: HttpExtra,
+    pk: string | null, sessionId: string, expiresInSeconds: number, extra?: HttpExtra, deviceId?: string,
   ): Promise<UserSessionRecord> {
     const headers = extra?.headers ?? {};
     const ip = extra ? this.adminforth.auth.getClientIp(headers) : null;
@@ -317,7 +322,8 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
       nonce = createNonce();
       this.setNonceCookie(extra.response, nonce.current, expiresInSeconds);
     }
-    await this.kv.set(userKey(pk, sessionId), JSON.stringify({ ...record, nonce }), expiresInSeconds, this.collection);
+    const stored: UserSessionRecord = { ...record, nonce, device_id: deviceId };
+    await this.kv.set(userKey(pk, sessionId), JSON.stringify(stored), expiresInSeconds, this.collection);
     return record;
   }
 
@@ -329,17 +335,9 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
   }
 
   /**
-   * Recognizes the browser by a long-lived device cookie and reports the sign-in when the device or
-   * the country is new for the user. The first sign-in of a user is reported too, its device is new.
+   * Gives the browser its long-lived device cookie and returns the device id from it.
    */
-  private async trackDevice({ pk, username, sessionId, expiresInSeconds, extra, session }: {
-    pk: string | null,
-    username: string,
-    sessionId: string,
-    expiresInSeconds: number,
-    extra: HttpExtra,
-    session: UserSessionRecord,
-  }) {
+  private setDeviceCookie(extra: HttpExtra): string {
     const auth = this.adminforth.auth;
     const cookie = auth.getCustomCookie({ cookies: extra.cookies, name: DEVICE_COOKIE });
     // the cookie comes from the client, a malformed one is replaced like a missing one
@@ -349,7 +347,22 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
       response: extra.response,
       payload: { name: DEVICE_COOKIE, value: deviceId, expirySeconds: KNOWN_DEVICE_TTL_SECONDS, httpOnly: true },
     });
+    return deviceId;
+  }
 
+  /**
+   * Reports the sign-in when the device or the country is new for the user.
+   * The first sign-in of a user is reported too, its device is new.
+   */
+  private async trackDevice({ pk, username, sessionId, expiresInSeconds, deviceId, session }: {
+    pk: string | null,
+    username: string,
+    sessionId: string,
+    expiresInSeconds: number,
+    deviceId: string,
+    session: UserSessionRecord,
+  }) {
+    const auth = this.adminforth.auth;
     const knownDevices = await this.listOfUser<KnownDeviceRecord>(pk, this.devicesCollection);
     const device = parseUserAgent(session.user_agent, false);
     const known = knownDevices.find(([id]) => id === deviceId)?.[1];
@@ -393,8 +406,22 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
     });
   }
 
-  private async verifyRevokeToken(token: string): Promise<RevokeTokenPayload | null> {
-    return await this.adminforth.auth.verify(token, REVOKE_TOKEN_TYPE, false) as RevokeTokenPayload | null;
+  private async verifyRevokeToken(token: string) {
+    const payload = await this.adminforth.auth.verify(token, REVOKE_TOKEN_TYPE, false) as (RevokeTokenPayload & { exp: number }) | null;
+    // the link works once, so a leaked one can't sign the browser out again after its next sign-in
+    if (!payload || await this.kv.get(userKey(payload.pk, payload.sessionId), this.usedLinksCollection)) {
+      return null;
+    }
+    return payload;
+  }
+
+  /**
+   * Sessions of the browser from a revoke link: the reported one and later sign-ins from that browser,
+   * which were not reported as the device was known by then.
+   */
+  private async sessionsOfDevice({ pk, sessionId, deviceId }: RevokeTokenPayload): Promise<[string, UserSessionRecord][]> {
+    const sessions = await this.listOfUser<UserSessionRecord>(pk, this.collection);
+    return sessions.filter(([id, record]) => id === sessionId || record.device_id === deviceId);
   }
 
   /**
@@ -484,7 +511,7 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
   private async revokeCopiedSession(key: string, adminUser: AdminUser, record: UserSessionRecord, extra: HttpExtra) {
     await this.revokeSession(key);
 
-    const { nonce, ...session } = record;
+    const { nonce, device_id, ...session } = record;
     const ip = this.adminforth.auth.getClientIp(extra.headers);
     // not awaited: a slow handler (e.g. a request to Slack) must not delay the response
     this.resolveCountry(ip, extra.headers)
@@ -537,7 +564,7 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
     const records = await this.listOfUser<UserSessionRecord>(userPk, this.collection);
 
     return records
-      .map(([sessionId, { nonce, ...record }]) => ({
+      .map(([sessionId, { nonce, device_id, ...record }]) => ({
         ...record,
         sessionId,
         isCurrent: sessionId === currentSessionId,
@@ -612,11 +639,14 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
           response.setStatus(400);
           return { error: INVALID_LINK_ERROR };
         }
-        const stored = await this.kv.get(userKey(token.pk, token.sessionId), this.collection);
-        if (!stored) {
+        const sessions = await this.sessionsOfDevice(token);
+        // the latest session of the browser when the reported one has ended: it may have signed out and in again
+        const shown = sessions.find(([id]) => id === token.sessionId)
+          ?? sessions.sort(([, a], [, b]) => b.created_at.localeCompare(a.created_at))[0];
+        if (!shown) {
           return { session: null };
         }
-        const { ip, country, user_agent, created_at } = JSON.parse(stored) as UserSessionRecord;
+        const { ip, country, user_agent, created_at } = shown[1];
         return { session: { ip, country, created_at, device: parseUserAgent(user_agent) } };
       },
     });
@@ -633,11 +663,15 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
           response.setStatus(400);
           return { error: INVALID_LINK_ERROR };
         }
+        const sessions = await this.sessionsOfDevice(token);
+        // the reported session is revoked even when it is not listed, e.g. past the list limit
+        const sessionIds = new Set([token.sessionId, ...sessions.map(([id]) => id)]);
         await Promise.all([
-          this.revokeSession(userKey(token.pk, token.sessionId)),
+          ...[...sessionIds].map((id) => this.revokeSession(userKey(token.pk, id))),
           // the device is not trusted anymore, so the next sign-in from it is reported again
           this.kv.delete(userKey(token.pk, token.deviceId), this.devicesCollection),
         ]);
+        await this.kv.set(userKey(token.pk, token.sessionId), '1', secondsLeft(token.exp), this.usedLinksCollection);
         return { ok: true };
       },
     });

@@ -15,6 +15,11 @@ export interface UserSessionRecord {
    * It is a secret of the browser, so it is never sent to the frontend or passed to callbacks.
    */
   nonce?: SessionNonce;
+  /**
+   * Device id of the browser, present for sessions signed in while {@link PluginOptions.onNewLogin} is set,
+   * so the revoke link ends every session of that browser. It is a secret of the browser like `nonce`.
+   */
+  device_id?: string;
 }
 
 /**
@@ -47,7 +52,7 @@ export interface SessionDevice {
 /**
  * One session as it is returned to the settings page.
  */
-export interface UserSessionListItem extends Omit<UserSessionRecord, 'nonce'> {
+export interface UserSessionListItem extends Omit<UserSessionRecord, 'nonce' | 'device_id'> {
   sessionId: string;
   isCurrent: boolean;
   /** Null when the session was stored without a user agent. */

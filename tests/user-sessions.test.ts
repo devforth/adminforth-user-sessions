@@ -791,6 +791,18 @@ describe('new login notifications', () => {
 
     expect(extra.response.cookies).toEqual([]);
     expect([...kv.entries.keys()].some((key) => key.startsWith(DEVICES_COLLECTION))).toBe(false);
+    expect(storedSession('session-1')).not.toHaveProperty('device_id');
+  });
+
+  it('stores the device of the session, keeping it out of the list and the callback', async () => {
+    const onNewLogin = vi.fn(async (_params: any) => {});
+    const endpoints = endpointsOf(activate({ onNewLogin }));
+    const extra = await login('session-1');
+
+    expect(storedSession('session-1').device_id).toEqual(deviceCookieOf(extra).value);
+    expect(onNewLogin.mock.calls[0][0].session).not.toHaveProperty('device_id');
+    const { sessions } = await endpoints['POST /plugin/user-sessions/list']({ adminUser: USER, body: {} });
+    expect(sessions[0]).not.toHaveProperty('device_id');
   });
 
   it('reports the first sign-in of a user, remembering its device', async () => {
@@ -971,6 +983,54 @@ describe('new login notifications', () => {
       expect(await kv.get(`${USER.pk}:first-session`, 'adminforth-user-sessions')).not.toBeNull();
       expect(knownDevice(deviceId)).toBeUndefined();
     });
+
+    it('ends every session of the reported browser, keeping other browsers signed in', async () => {
+      const { endpoints, token, deviceId } = await reportedLogin('session-2');
+      // the device is known now, so this sign-in is not reported
+      await login('session-3', 3600, HEADERS, deviceId);
+
+      await endpoints['POST /plugin/user-sessions/revoke-by-token']({ body: { token }, response: responseStub() });
+
+      expect(await kv.get(`${USER.pk}:session-2`, 'adminforth-user-sessions')).toBeNull();
+      expect(await kv.get(`${USER.pk}:session-3`, 'adminforth-user-sessions')).toBeNull();
+      expect(await kv.get(`${USER.pk}:first-session`, 'adminforth-user-sessions')).not.toBeNull();
+    });
+
+    it('ends the reported session signed in before device ids were stored', async () => {
+      const { endpoints, token } = await reportedLogin('session-2');
+      const { device_id, ...legacy } = storedSession('session-2');
+      await kv.set(`${USER.pk}:session-2`, JSON.stringify(legacy), 3600, 'adminforth-user-sessions');
+
+      await endpoints['POST /plugin/user-sessions/revoke-by-token']({ body: { token }, response: responseStub() });
+
+      expect(await kv.get(`${USER.pk}:session-2`, 'adminforth-user-sessions')).toBeNull();
+    });
+
+    it('shows the latest session of the browser when the reported one has ended', async () => {
+      const { endpoints, token, deviceId } = await reportedLogin('session-2');
+      await kv.delete(`${USER.pk}:session-2`, 'adminforth-user-sessions');
+      await login('session-3', 3600, { ...HEADERS, 'x-forwarded-for': '1.1.1.1' }, deviceId);
+
+      const result = await endpoints['POST /plugin/user-sessions/session-by-token']({ body: { token }, response: responseStub() });
+
+      expect(result.session.ip).toEqual('1.1.1.1');
+    });
+
+    it('works once: a replayed link leaves a later sign-in of the browser alone', async () => {
+      const { endpoints, token, deviceId } = await reportedLogin('session-2');
+      await endpoints['POST /plugin/user-sessions/revoke-by-token']({ body: { token }, response: responseStub() });
+      await login('session-3', 3600, HEADERS, deviceId);
+
+      const response = responseStub();
+      const result = await endpoints['POST /plugin/user-sessions/revoke-by-token']({ body: { token }, response });
+
+      expect(result).toEqual({ error: 'Link is invalid or expired' });
+      expect(response.status).toEqual(400);
+      expect(await kv.get(`${USER.pk}:session-3`, 'adminforth-user-sessions')).not.toBeNull();
+      expect(knownDevice(deviceId)).toBeDefined();
+      expect(await endpoints['POST /plugin/user-sessions/session-by-token']({ body: { token }, response: responseStub() }))
+        .toEqual({ error: 'Link is invalid or expired' });
+    });
   });
 });
 
@@ -994,8 +1054,8 @@ describe('copied session detection', () => {
   /**
    * Signs in as `session-1` and gives the nonce the browser got.
    */
-  async function signIn(onSessionCopied: (params: any) => Promise<void> = vi.fn(async () => {})) {
-    activate({ onSessionCopied });
+  async function signIn(onSessionCopied: (params: any) => Promise<void> = vi.fn(async () => {}), options: Record<string, any> = {}) {
+    activate({ onSessionCopied, ...options });
     return nonceCookieOf(await login('session-1')).value as string;
   }
 
@@ -1105,7 +1165,8 @@ describe('copied session detection', () => {
 
   it('revokes and reports the session when the previous nonce comes after the new one was used', async () => {
     const onSessionCopied = vi.fn(async (_params: any) => {});
-    const nonce = await signIn(onSessionCopied);
+    // the session stores its device too, which must not reach the callback
+    const nonce = await signIn(onSessionCopied, { onNewLogin: vi.fn(async () => {}) });
     const newNonce = await rotate(nonce);
     await request(newNonce);
     vi.advanceTimersByTime(60 * 1000);

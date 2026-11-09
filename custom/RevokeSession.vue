@@ -47,7 +47,7 @@
           :disabled="inProgress"
           @click="revoke"
         >
-          {{ $t('This wasn\'t me, end this session') }}
+          {{ $t('This wasn\'t me, sign out this device') }}
         </Button>
       </template>
     </DialogPanel>
@@ -122,8 +122,8 @@ const header = computed(() => ({
   },
   revoked: {
     icon: IconCircleCheck,
-    title: t('Session ended'),
-    subtitle: t('That device has been signed out.'),
+    title: t('Device signed out'),
+    subtitle: t('Every session of that device has ended. Change your password to keep it out.'),
   },
 }[state.value as Exclude<PageState, 'loading'>]));
 
