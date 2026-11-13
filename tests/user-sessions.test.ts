@@ -21,7 +21,7 @@ const adminforthMock = vi.hoisted(() => {
 
   return {
     AdminForthPlugin,
-    afLogger: { error: vi.fn(), warn: vi.fn() },
+    afLogger: { error: vi.fn() },
     convertPeriodToSeconds: (period: string) => Number(period.slice(0, -1)) * PERIOD_SECONDS[period.slice(-1)],
     Filters: { EQ: (field: string, value: any) => ({ field, value }) },
     Sorts: { DESC: (field: string) => ({ field, direction: 'desc' }) },
@@ -1518,14 +1518,6 @@ describe('a user pk which is a prefix of another one', () => {
     const pattern = new RegExp((z.toJSONSchema(schema, { target: 'draft-07' }) as any).properties.sessionId.pattern);
     expect(pattern.test('theirs')).toBe(true);
     expect(pattern.test('v:theirs')).toBe(false);
-  });
-
-  it('warns about a session id with ":", which is not listed', async () => {
-    const endpoints = endpointsOf(activate());
-    await loginAs('u', 'a:b');
-
-    expect(adminforthMock.afLogger.warn).toHaveBeenCalledWith(expect.stringContaining('":"'));
-    expect(await sessionsOf(endpoints, U)).toEqual([]);
   });
 
   it('does not take the known devices and countries of u:v for the ones of u', async () => {

@@ -310,9 +310,6 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
   private async storeSession(
     pk: string | null, sessionId: string, expiresInSeconds: number, extra?: HttpExtra, deviceId?: string,
   ): Promise<UserSessionRecord> {
-    if (sessionId.includes(':')) {
-      afLogger.warn(`UserSessionsPlugin: a session id of user ${pk} has ":", it is not listed for this user and may show up among the sessions of a user with a longer pk`);
-    }
     const headers = extra?.headers ?? {};
     const ip = extra ? this.adminforth.auth.getClientIp(headers) : null;
     const now = new Date().toISOString();

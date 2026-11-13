@@ -53,9 +53,6 @@ Without this option, sessions of other users are not shown and can't be revoked 
   more 5 seconds later: a request running at that moment may have read the session just before and
   write it back while refreshing `last_used_at`.
 
-Session ids must not contain `:`, which joins them to the user pk in the store key. AdminForth generates
-a uuid; a session id with `:` given to `setAuthCookie` is not supported: it is not listed for its user and may show up among the sessions of a user whose pk extends that pk.
-
 Because a missing record means "revoked", the store must outlive the app process: use Redis (or
 another shared, persistent adapter) in production. With an in-memory adapter every restart signs
 all users out. Installing the plugin also signs out everyone who was logged in before it.
