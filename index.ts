@@ -37,8 +37,10 @@ const REVOKE_REPEAT_DELAY_MS = 5000;
 const ENDPOINTS_PREFIX = '/plugin/user-sessions';
 // listing is done for one user only, so the limit is just a sanity cap
 const PER_USER_LIST_LIMIT = 500;
-// sessions of all users are revoked in batches, so the whole store is never loaded at once
-const REVOKE_ALL_BATCH_SIZE = 500;
+// sessions are revoked in batches, so the whole store is never loaded at once
+const REVOKE_BATCH_SIZE = 500;
+// listings which bring no session revoked before: the adapter does not delete or does not list its own keys
+const REVOKE_MAX_STALLED_ROUNDS = 3;
 // real user agents are well under this; the header itself is client-controlled and can be ~16KB
 const USER_AGENT_MAX_LENGTH = 512;
 const COUNTRY_CODE_RE = /^[A-Z]{2}$/;
@@ -426,18 +428,37 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
 
   /**
    * Revokes every stored session of every user, the caller's own one included, so everybody is signed
-   * out on their next request. Known devices are kept. Returns the number of revoked sessions.
+   * out on their next request. Known devices are kept. Returns the number of revoked sessions, throws when
+   * the store keeps listing sessions which were already revoked.
    */
   async revokeAllSessions(): Promise<number> {
-    let revoked = 0;
-    let keys: string[];
-    do {
-      const rows = await this.kv.listByPrefix('', REVOKE_ALL_BATCH_SIZE, this.collection);
-      keys = rows.map((row) => Object.keys(row)[0]);
-      await Promise.all(keys.map((key) => this.revokeSession(key)));
-      revoked += keys.length;
-    } while (keys.length === REVOKE_ALL_BATCH_SIZE);
+    const { revoked, done } = await this.revokeByPrefix('', () => true);
+    if (!done) {
+      throw new Error(`UserSessionsPlugin: revoked ${revoked} sessions, but the store still lists sessions which were revoked`);
+    }
     return revoked;
+  }
+
+  /**
+   * Revokes the sessions listed under the prefix which `isRevocable` accepts. A listing gives one batch, so it is
+   * repeated until nothing revocable is listed; `done` is false when listings stopped bringing new sessions.
+   * The adapter must fill a listing with active sessions: @adminforth/key-value-adapter-redis 2.0.5 or later.
+   */
+  private async revokeByPrefix(prefix: string, isRevocable: (key: string) => boolean): Promise<{ revoked: number, done: boolean }> {
+    const revoked = new Set<string>();
+    let stalledRounds = 0;
+    while (stalledRounds < REVOKE_MAX_STALLED_ROUNDS) {
+      const rows = await this.kv.listByPrefix(prefix, REVOKE_BATCH_SIZE, this.collection);
+      const keys = rows.map((row) => Object.keys(row)[0]).filter(isRevocable);
+      if (!keys.length) {
+        return { revoked: revoked.size, done: true };
+      }
+      // a session written back by a request racing the revoke is listed again, but counted once
+      stalledRounds = keys.some((key) => !revoked.has(key)) ? 0 : stalledRounds + 1;
+      await Promise.all(keys.map((key) => this.revokeSession(key)));
+      keys.forEach((key) => revoked.add(key));
+    }
+    return { revoked: revoked.size, done: false };
   }
 
   /**
@@ -619,10 +640,14 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
           return { error: 'Not allowed to manage sessions of this user' };
         }
         // session the request is made with survives, for another user it means all of their sessions go
-        const sessions = await this.listSessions(userPk, adminUser.sessionId);
-        const revoked = sessions.filter((session) => !session.isCurrent);
-        await Promise.all(revoked.map((session) => this.revokeSession(userKey(userPk, session.sessionId))));
-        return { ok: true, revoked: revoked.length };
+        const prefix = `${userPk}:`;
+        const currentKey = adminUser.sessionId && userKey(adminUser.pk, adminUser.sessionId);
+        // the prefix of user `u` also lists sessions of user `u:v`, which are not to be touched
+        const { revoked, done } = await this.revokeByPrefix(prefix, (key) => key !== currentKey && !key.slice(prefix.length).includes(':'));
+        if (!done) {
+          afLogger.error(`UserSessionsPlugin: revoked ${revoked} sessions of user ${userPk}, but the store still lists sessions which were revoked`);
+        }
+        return { ok: done, revoked };
       },
     });
 

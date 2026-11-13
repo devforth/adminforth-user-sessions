@@ -575,6 +575,77 @@ describe('endpoints', () => {
     expect(await kv.get(`${USER.pk}:session-3`, 'adminforth-user-sessions')).toBeNull();
   });
 
+  it('revokes every other session past the listing cap', async () => {
+    const endpoints = endpointsOf(activate());
+    await login('current');
+    for (let i = 0; i < 501; i++) {
+      await login(`other-${i}`);
+    }
+
+    const result = await endpoints['POST /plugin/user-sessions/revoke-others']({
+      adminUser: { ...USER, sessionId: 'current' },
+      body: {},
+      response: responseStub(),
+    });
+
+    expect(result).toEqual({ ok: true, revoked: 501 });
+    expect(await kv.listByPrefix(`${USER.pk}:`, 1000, 'adminforth-user-sessions')).toEqual([
+      { [`${USER.pk}:current`]: expect.any(String) },
+    ]);
+  });
+
+  it('gives up instead of looping forever when the adapter does not delete', async () => {
+    const endpoints = endpointsOf(activate());
+    await login('current');
+    await login('other');
+    kv.delete = async () => {};
+
+    const result = await endpoints['POST /plugin/user-sessions/revoke-others']({
+      adminUser: { ...USER, sessionId: 'current' },
+      body: {},
+      response: responseStub(),
+    });
+
+    expect(result).toEqual({ ok: false, revoked: 1 });
+    expect(adminforthMock.afLogger.error).toHaveBeenCalledWith(
+      'UserSessionsPlugin: revoked 1 sessions of user user-1, but the store still lists sessions which were revoked',
+    );
+  });
+
+  it('keeps the current session of a user with integer primary key, which the users show page sends as a string', async () => {
+    const endpoints = endpointsOf(activate({ canManageOtherUsersSessions: async () => false }));
+    for (const sessionId of ['own-session', 'other-session']) {
+      await hooks().sessionCreated({
+        pk: 7, username: 'someone', sessionId, expiresInSeconds: 3600, adminforth, extra: extraOf(),
+      });
+    }
+
+    const result = await endpoints['POST /plugin/user-sessions/revoke-others']({
+      adminUser: { ...USER, pk: 7, sessionId: 'own-session' },
+      body: { userPk: '7' },
+      response: responseStub(),
+    });
+
+    expect(result).toEqual({ ok: true, revoked: 1 });
+    expect(await kv.get('7:own-session', 'adminforth-user-sessions')).not.toBeNull();
+  });
+
+  it('does not revoke sessions of a user whose primary key extends the one of the caller', async () => {
+    const endpoints = endpointsOf(activate());
+    for (const [pk, sessionId] of [['1', 'own'], ['1', 'other'], ['1:2', 'neighbour']] as const) {
+      await hooks().sessionCreated({ pk, username: 'someone', sessionId, expiresInSeconds: 3600, adminforth, extra: extraOf() });
+    }
+
+    const result = await endpoints['POST /plugin/user-sessions/revoke-others']({
+      adminUser: { ...USER, pk: '1', sessionId: 'own' },
+      body: {},
+      response: responseStub(),
+    });
+
+    expect(result).toEqual({ ok: true, revoked: 1 });
+    expect(await kv.get('1:2:neighbour', 'adminforth-user-sessions')).not.toBeNull();
+  });
+
   it('treats sessions as own for integer primary key, which the users show page sends as a string', async () => {
     const endpoints = endpointsOf(activate({ canManageOtherUsersSessions: async () => false }));
     await hooks().sessionCreated({
@@ -719,6 +790,22 @@ describe('sessions of other users', () => {
     expect(await kv.get(`${USER.pk}:their-second`, 'adminforth-user-sessions')).toBeNull();
     expect(await kv.get(`${SUPERADMIN.pk}:${SUPERADMIN.sessionId}`, 'adminforth-user-sessions')).not.toBeNull();
   });
+
+  it('are all revoked, including one with the same id as the session of the one who revokes', async () => {
+    const endpoints = endpointsOf(activate({ canManageOtherUsersSessions: async () => true }));
+    await loginOf(SUPERADMIN.pk, SUPERADMIN.sessionId);
+    await login(SUPERADMIN.sessionId);
+
+    const result = await endpoints['POST /plugin/user-sessions/revoke-others']({
+      adminUser: SUPERADMIN,
+      body: { userPk: USER.pk },
+      response: responseStub(),
+    });
+
+    expect(result).toEqual({ ok: true, revoked: 1 });
+    expect(await kv.get(`${USER.pk}:${SUPERADMIN.sessionId}`, 'adminforth-user-sessions')).toBeNull();
+    expect(await kv.get(`${SUPERADMIN.pk}:${SUPERADMIN.sessionId}`, 'adminforth-user-sessions')).not.toBeNull();
+  });
 });
 
 describe('revoking all sessions', () => {
@@ -744,6 +831,42 @@ describe('revoking all sessions', () => {
 
     expect(await plugin.revokeAllSessions()).toEqual(501);
     expect(await kv.listByPrefix('', 1, 'adminforth-user-sessions')).toEqual([]);
+  });
+
+  it('revokes every session when listings come back short, as expired sessions count toward their limit', async () => {
+    const plugin = activate();
+    // an index of Redis adapter before 2.0.5 counts expired sessions toward the limit, without returning them
+    for (let i = 0; i < 300; i++) {
+      await kv.set(`${USER.pk}:expired-${i}`, 'expired', undefined, 'adminforth-user-sessions');
+    }
+    const list = kv.listByPrefix.bind(kv);
+    kv.listByPrefix = async (...args: Parameters<typeof list>) =>
+      (await list(...args)).filter((row) => Object.values(row)[0] !== 'expired');
+    for (let i = 0; i < 1200; i++) {
+      await login(`session-${i}`);
+    }
+
+    expect(await plugin.revokeAllSessions()).toEqual(1200);
+    expect(await list('', 2000, 'adminforth-user-sessions')).toHaveLength(300);
+  });
+
+  it('throws when the store keeps listing sessions which were revoked', async () => {
+    const plugin = activate();
+    await login('session-1');
+    kv.delete = async () => {};
+
+    await expect(plugin.revokeAllSessions()).rejects.toThrow(
+      'UserSessionsPlugin: revoked 1 sessions, but the store still lists sessions which were revoked',
+    );
+  });
+
+  it('does not stop at a fixed number of rounds', async () => {
+    const plugin = activate();
+    for (let i = 0; i < 50_500; i++) {
+      await kv.set(`user-${i}:session`, 'session', undefined, 'adminforth-user-sessions');
+    }
+
+    expect(await plugin.revokeAllSessions()).toEqual(50_500);
   });
 });
 
