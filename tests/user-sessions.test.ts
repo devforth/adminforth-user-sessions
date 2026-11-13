@@ -21,7 +21,7 @@ const adminforthMock = vi.hoisted(() => {
 
   return {
     AdminForthPlugin,
-    afLogger: { error: vi.fn() },
+    afLogger: { error: vi.fn(), warn: vi.fn() },
     convertPeriodToSeconds: (period: string) => Number(period.slice(0, -1)) * PERIOD_SECONDS[period.slice(-1)],
     Filters: { EQ: (field: string, value: any) => ({ field, value }) },
     Sorts: { DESC: (field: string) => ({ field, direction: 'desc' }) },
@@ -1437,5 +1437,120 @@ describe('login history', () => {
 
     expect(failedRecords().map((record) => Object.keys(record.ips))).toEqual([['10.0.0.2'], ['10.0.0.3']]);
     expect(adminforth.loginHistory.records.filter((record) => record.success)).toHaveLength(1);
+  });
+});
+
+describe('a user pk which is a prefix of another one', () => {
+  // keys are `<pk>:<id>`, so `u:` of user `u` is a prefix of the keys of user `u:v` as well
+  const SESSIONS = 'adminforth-user-sessions';
+  const U = { pk: 'u', username: 'u', dbUser: {}, sessionId: 'own' };
+
+  async function loginAs(pk: string, sessionId: string, deviceId?: string) {
+    await hooks().sessionCreated({ pk, username: pk, sessionId, expiresInSeconds: 3600, adminforth, extra: extraOf(HEADERS, deviceId) });
+  }
+
+  async function sessionsOf(endpoints: Record<string, Function>, adminUser: object) {
+    return (await endpoints['POST /plugin/user-sessions/list']({ adminUser, body: {} })).sessions;
+  }
+
+  it('lists the sessions of every user without the ones of a longer pk', async () => {
+    const endpoints = endpointsOf(activate());
+    await loginAs('u', 'own');
+    await loginAs('u:v', 'theirs');
+    await loginAs('u:v:w', 'deeper');
+
+    expect(await sessionsOf(endpoints, U)).toEqual([expect.objectContaining({ sessionId: 'own', isCurrent: true })]);
+    expect(await sessionsOf(endpoints, { ...U, pk: 'u:v', sessionId: 'theirs' }))
+      .toEqual([expect.objectContaining({ sessionId: 'theirs', isCurrent: true })]);
+  });
+
+  it('lists a full page of an ordinary user with one request', async () => {
+    const endpoints = endpointsOf(activate());
+    for (let i = 0; i < 500; i++) {
+      await loginAs('u', `own-${i}`);
+    }
+    const listByPrefix = vi.spyOn(kv, 'listByPrefix');
+
+    expect(await sessionsOf(endpoints, U)).toHaveLength(500);
+    expect(listByPrefix).toHaveBeenCalledTimes(1);
+  });
+
+  it('lists the sessions of u when more sessions of u:v than fit into a page come first', async () => {
+    const endpoints = endpointsOf(activate());
+    // this adapter lists in insertion order; Redis lists in byte order, where `7:2:…` comes before most of `7:<uuid>`
+    for (let i = 0; i < 600; i++) {
+      await loginAs('u:v', `theirs-${i}`);
+    }
+    for (let i = 0; i < 10; i++) {
+      await loginAs('u', `own-${i}`);
+    }
+
+    expect(await sessionsOf(endpoints, U)).toHaveLength(10);
+  });
+
+  it('leaves the sessions of u:v alone when u revokes its other sessions', async () => {
+    const endpoints = endpointsOf(activate());
+    await loginAs('u', 'own');
+    await loginAs('u', 'other');
+    await loginAs('u:v', 'theirs');
+
+    const result = await endpoints['POST /plugin/user-sessions/revoke-others']({ adminUser: U, body: {}, response: responseStub() });
+
+    expect(result).toEqual({ ok: true, revoked: 1 });
+    expect(await kv.get('u:other', SESSIONS)).toBeNull();
+    expect(await kv.get('u:v:theirs', SESSIONS)).not.toBeNull();
+  });
+
+  it('refuses to revoke a session id with ":", also by the JSON Schema the server validates with', async () => {
+    const { z } = await import('zod');
+    let schema: any;
+    activate().setupEndpoints({
+      endpoint: ({ path, request_schema }: any) => {
+        if (path === '/plugin/user-sessions/revoke') {
+          schema = request_schema;
+        }
+      },
+    });
+
+    expect(schema.safeParse({ sessionId: 'theirs' }).success).toBe(true);
+    expect(schema.safeParse({ sessionId: 'v:theirs' }).success).toBe(false);
+    // a refine() would be dropped there
+    const pattern = new RegExp((z.toJSONSchema(schema, { target: 'draft-07' }) as any).properties.sessionId.pattern);
+    expect(pattern.test('theirs')).toBe(true);
+    expect(pattern.test('v:theirs')).toBe(false);
+  });
+
+  it('warns about a session id with ":", which is not listed', async () => {
+    const endpoints = endpointsOf(activate());
+    await loginAs('u', 'a:b');
+
+    expect(adminforthMock.afLogger.warn).toHaveBeenCalledWith(expect.stringContaining('":"'));
+    expect(await sessionsOf(endpoints, U)).toEqual([]);
+  });
+
+  it('does not take the known devices and countries of u:v for the ones of u', async () => {
+    const onNewLogin = vi.fn(async (_params: any) => {});
+    activate({ onNewLogin });
+    const deviceId = crypto.randomUUID();
+    await loginAs('u:v', 'theirs', deviceId);
+
+    await loginAs('u', 'own', deviceId);
+
+    expect(onNewLogin).toHaveBeenLastCalledWith(expect.objectContaining({ pk: 'u', reasons: ['new_device', 'new_country'] }));
+  });
+
+  it('neither shows nor ends a session of u:v from the same browser by a revoke link of u', async () => {
+    const endpoints = endpointsOf(activate({ onNewLogin: async () => {} }));
+    const deviceId = crypto.randomUUID();
+    await loginAs('u:v', 'theirs', deviceId);
+    await loginAs('u', 'own', deviceId);
+    // the reported session has ended, so the link shows the latest session of the browser
+    await kv.delete('u:own', SESSIONS);
+    const token = adminforth.auth.issueJWT({ pk: 'u', sessionId: 'own', deviceId }, 'userSessionRevoke');
+
+    expect(await endpoints['POST /plugin/user-sessions/session-by-token']({ body: { token }, response: responseStub() }))
+      .toEqual({ session: null });
+    await endpoints['POST /plugin/user-sessions/revoke-by-token']({ body: { token }, response: responseStub() });
+    expect(await kv.get('u:v:theirs', SESSIONS)).not.toBeNull();
   });
 });

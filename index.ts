@@ -35,6 +35,9 @@ const DEFAULT_NONCE_ROTATION_MINUTES = 5;
 // way longer than a request takes between reading the session and writing it back in touchSession
 const REVOKE_REPEAT_DELAY_MS = 5000;
 const ENDPOINTS_PREFIX = '/plugin/user-sessions';
+// listings of a user while keys of a longer pk under its prefix (`u:v:` under `u:`) fill the page;
+// more than about 1500 such keys sorted first still hide the user's own
+const PER_USER_LIST_ROUNDS = 3;
 // listing is done for one user only, so the limit is just a sanity cap
 const PER_USER_LIST_LIMIT = 500;
 // sessions of all users are revoked in batches, so the whole store is never loaded at once
@@ -60,7 +63,8 @@ const listBodySchema = z.object({
 }).strict();
 
 const revokeBodySchema = z.object({
-  sessionId: z.string(),
+  // ":" would address a key of another user; regex, as refine() is lost in the JSON Schema the server validates with
+  sessionId: z.string().regex(/^[^:]+$/),
   userPk: z.string().optional(),
 }).strict();
 
@@ -306,6 +310,9 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
   private async storeSession(
     pk: string | null, sessionId: string, expiresInSeconds: number, extra?: HttpExtra, deviceId?: string,
   ): Promise<UserSessionRecord> {
+    if (sessionId.includes(':')) {
+      afLogger.warn(`UserSessionsPlugin: a session id of user ${pk} has ":", it is not listed for this user and may show up among the sessions of a user with a longer pk`);
+    }
     const headers = extra?.headers ?? {};
     const ip = extra ? this.adminforth.auth.getClientIp(headers) : null;
     const now = new Date().toISOString();
@@ -551,12 +558,23 @@ export default class UserSessionsPlugin extends AdminForthPlugin {
 
   /**
    * Records of one user in the collection as `[id, record]` pairs, keys there are `<user pk>:<id>`.
+   * An id has no `:`, so a key with one after the prefix is of a longer pk, like `u:v:<id>` for `u`.
    */
   private async listOfUser<T>(pk: string | null, collection: string): Promise<[string, T][]> {
-    const rows = await this.kv.listByPrefix(`${pk}:`, PER_USER_LIST_LIMIT, collection);
-    return rows.map((row) => {
+    const prefix = `${pk}:`;
+    let limit = PER_USER_LIST_LIMIT;
+    let own: Record<string, string>[] = [];
+    for (let round = 0; round < PER_USER_LIST_ROUNDS; round++) {
+      const rows = await this.kv.listByPrefix(prefix, limit, collection);
+      own = rows.filter((row) => !Object.keys(row)[0].slice(prefix.length).includes(':'));
+      if (rows.length < limit || own.length >= PER_USER_LIST_LIMIT) {
+        break;
+      }
+      limit = PER_USER_LIST_LIMIT + rows.length - own.length;
+    }
+    return own.map((row) => {
       const [key] = Object.keys(row);
-      return [key.slice(key.lastIndexOf(':') + 1), JSON.parse(row[key]) as T];
+      return [key.slice(prefix.length), JSON.parse(row[key]) as T];
     });
   }
 
